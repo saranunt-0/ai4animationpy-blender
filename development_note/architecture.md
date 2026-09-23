@@ -1,0 +1,38 @@
+# Architecture: AI4Animation in Blender
+
+```
+Blender (bundled Python, NumPy only)            Model environment (Python >= 3.12, torch)
+------------------------------------            -----------------------------------------
+ui.py / operators.py
+   │
+pipeline.py ── build_request ──▶ request.npz ──▶ runner/ai4a_runner.py
+   │              ▲                                 AI4Animation(MANUAL) + Demos/Authoring
+blender_io.py     │ middleware (pure NumPy)          MotionController, PathPlanner3D
+ (only bpy I/O)   │  conventions / rig /             fixed dt, sub-stepped to ~60 Hz
+   │              │  features / exchange
+   └── bake ◀── apply_result ◀── result.npz ◀──────┘
+```
+
+## Boundaries
+
+| Layer | Knows about | Must not know about |
+|---|---|---|
+| `middleware/` | NumPy, both coordinate conventions | bpy, torch |
+| `blender_io.py` | bpy, mathutils | model maths |
+| `runner/` | ai4animation, torch, Demos/Authoring | Blender conventions |
+| exchange `.npz` | AI4Animation world space only | Blender |
+
+## Key decisions
+
+1. **Subprocess instead of in-process.** `setup.py` requires Python >= 3.12.12 and
+   torch. Blender ships its own Python (3.11 in 4.x/5.0) without torch. The
+   subprocess keeps both environments untouched.
+2. **Calibration from a pose correspondence, not from the rest pose.** The
+   glTF-imported Geno rest pose lies on its back; only the posed skeleton
+   matches. Offsets are per-bone rotations, and placement is removed by
+   rigid alignment (Kabsch).
+3. **Blender keys are `matrix_basis`**, computed by the middleware with Blender's
+   FK rule (`pose = parent_pose @ rest_rel @ basis`). After baking, Blender
+   is re-evaluated and compared with the model (self-check in the operator report).
+4. **Reuse the demo controller as-is.** The runner only wraps it with shims
+   (CPU `map_location`, cwd for `Guidances/`, in-place initial pose).
