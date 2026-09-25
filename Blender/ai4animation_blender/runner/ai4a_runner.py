@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import traceback
+import types
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,13 @@ IDLE_STYLE = "Idle"
 # The demo runs at display refresh rate; sub-stepping keeps the controller in
 # the regime it was tuned for when Blender scenes run at 24/25/30 fps.
 TARGET_SIMULATION_RATE = 60.0
+# Virtual player of the joystick controller (meters, m/s): release the stick
+# within STOP_RADIUS of a stopped reference, push again beyond RESUME_RADIUS,
+# never command more than MAX_COMMAND.
+STOP_RADIUS = 0.15
+RESUME_RADIUS = 0.5
+MAX_COMMAND = 3.0
+BRAKE = 1.0  # m/s^2, deceleration of the path reference before its end
 
 
 def log(*args):
@@ -184,14 +192,168 @@ class PathFollower:
         return np.asarray(self.Path.GetPathPoints(SPLINE_RESOLUTION), dtype=float)
 
 
-def build_follower(meta, arrays, warnings):
+class PathReference:
+    """Reference point moving along the path at the keyed speed (time-accurate).
+
+    Uses the same Catmull-Rom spline as the goal controller. The reference is
+    kept at most `leash` meters ahead of the character's projection onto the
+    path, so a lagging character is pulled along instead of cutting corners.
+    """
+
+    def __init__(self, path, end_behavior, leash, gain, spacing=0.05):
+        from ai4animation import Spline
+
+        length = max(float(path.GetPathLength()), 1e-5)
+        count = max(2, int(math.ceil(length / spacing)) + 1)
+        dense = np.asarray(Spline.GetPointsOnSpline(path.Points, count), dtype=float)
+        dense[:, 1] = 0.0
+        segment = np.linalg.norm(np.diff(dense, axis=0), axis=-1)
+        self.Points = dense
+        self.Arc = np.concatenate(([0.0], np.cumsum(segment)))
+        self.Length = float(self.Arc[-1])
+        self.EndBehavior = end_behavior
+        self.Leash = float(leash)
+        self.Tracker = ReferenceTracker(gain)
+        self.S = 0.0
+        self.Projected = 0.0
+        self.Sign = 1.0
+
+    def point_at(self, s):
+        s = min(max(s, 0.0), self.Length)
+        return np.array([np.interp(s, self.Arc, self.Points[:, k]) for k in range(3)])
+
+    def _project(self, position):
+        # Search near the current progress so self-crossing paths are followed in order.
+        lo, hi = self.Projected - 0.5 - self.Leash, self.Projected + 0.5 + self.Leash
+        candidates = np.nonzero((self.Arc >= lo) & (self.Arc <= hi))[0]
+        delta = self.Points[candidates] - position
+        delta[:, 1] = 0.0
+        return float(self.Arc[candidates[int(np.argmin(np.sum(delta * delta, axis=-1)))]])
+
+    def tangent_at(self, s, sign=1.0):
+        ahead = self.point_at(s + sign * 0.05) - self.point_at(s - sign * 0.05)
+        norm = float(np.linalg.norm(ahead))
+        return ahead / norm if norm > 1e-9 else np.zeros(3)
+
+    def command(self, position, speed, dt):
+        """Velocity command (m/s) of the virtual left stick.
+
+        The reference advances along the path at the keyed speed (time
+        accurate), at most `leash` ahead of the character's projection, and
+        with STOP brakes into the end at BRAKE m/s^2 (stopping it abruptly
+        from full speed makes the character overshoot by its momentum). The
+        stick tracks that point: feed-forward velocity + gain * offset.
+        Measured on S-curve / 90 degree corner / hairpin paths: tracking the
+        reference point is more stable under the network's reaction delay
+        than cross-track (path-normal) feedback, and gain 2/s beats 3 and 4
+        on tight turns. Returns (velocity, reference point).
+        """
+        position = np.array(position, dtype=float).reshape(3)
+        position[1] = 0.0
+        self.Projected = self._project(position)
+        stop = self.EndBehavior != exchange.END_PINGPONG
+        if stop:
+            speed = min(speed, math.sqrt(2.0 * BRAKE * max(self.Length - self.S, 0.0)))
+        s = self.S + self.Sign * speed * dt
+        s = min(s, self.Projected + self.Leash) if self.Sign > 0 else max(s, self.Projected - self.Leash)
+        if not stop and (s >= self.Length or s <= 0.0):
+            self.Sign = -self.Sign
+        self.S = min(max(s, 0.0), self.Length)
+        reference = self.point_at(self.S)
+        parked = stop and self.S >= self.Length - 1e-9
+        feedforward = np.zeros(3) if parked else self.tangent_at(self.S, self.Sign) * speed
+        return self.Tracker.command(reference, feedforward, position), reference
+
+    def sampled_points(self):
+        return self.Points
+
+
+class ReferenceTracker:
+    """Virtual player: turns a moving reference into a stick velocity command.
+
+    velocity = reference velocity (feed-forward) + gain * position error,
+    clamped to MAX_COMMAND. Pure velocity commands (a real gamepad) cannot
+    hold speeds below ~0.6 m/s or start walking below ~1 m/s from standing
+    with this network; tracking a position that moves at the keyed speed
+    makes both exact, like the goal controller, while keeping the joystick
+    controller's independent facing. When the reference stops, the stick is
+    released within STOP_RADIUS and re-engaged beyond RESUME_RADIUS.
+    """
+
+    def __init__(self, gain):
+        self.Gain = float(gain)
+        self.Engaged = True
+
+    def command(self, reference, reference_velocity, position):
+        error = np.asarray(reference, dtype=float).reshape(3) - np.asarray(position, dtype=float).reshape(3)
+        error[1] = 0.0
+        feedforward = np.asarray(reference_velocity, dtype=float).reshape(3).copy()
+        feedforward[1] = 0.0
+        distance = float(np.linalg.norm(error))
+        if float(np.linalg.norm(feedforward)) > 1e-6:
+            self.Engaged = True
+        elif self.Engaged and distance <= STOP_RADIUS:
+            self.Engaged = False
+        elif not self.Engaged and distance > RESUME_RADIUS:
+            self.Engaged = True
+        if not self.Engaged:
+            return np.zeros(3)
+        velocity = feedforward + self.Gain * error
+        speed = float(np.linalg.norm(velocity))
+        if speed > MAX_COMMAND:
+            velocity *= MAX_COMMAND / speed
+        return velocity
+
+
+def stick_control(self, command, control_strength, guidance_pose):
+    """Joystick controller of Demos/Locomotion/Biped/Program.py (Control).
+
+    Bound onto the Authoring MotionController in STICK mode, so Update,
+    PredictSequence and Animate stay exactly as in the demo. `command` is a
+    (velocity, direction) pair in world space: velocity = left stick * speed,
+    direction = right stick (zero = face the movement direction).
+    """
+    from ai4animation import Tensor, Time, Transform, Vector3
+
+    velocity, direction = command
+    position = Vector3.Lerp(
+        self.SimulationObject.GetPosition(0), self.Actor.GetRootPosition(), self.Synchronization
+    )
+    self.SimulationObject.Control(position, direction, velocity, Time.DeltaTime)
+
+    speed = float(np.linalg.norm(velocity))
+    template = self.GuidanceTemplates["Idle"].Positions if speed < 0.1 else guidance_pose
+    self.GuidanceControl.Positions = np.array(template, copy=True)
+
+    # Correction (identical in the Biped and Authoring controllers)
+    if self.Sequence is not None:
+        self.RootControl.Transforms = Transform.Interpolate(
+            self.SimulationObject.Transforms,
+            self.Sequence.Trajectory.Transforms,
+            self.TrajectoryCorrection,
+        )
+        for i in range(self.RootControl.SampleCount):
+            target = Transform.GetPosition(self.RootControl.Transforms)[i:]
+            current = self.Actor.GetRootPosition().reshape(-1, 3)
+            time = self.RootControl.Timestamps[i:].reshape(-1, 1)
+            self.RootControl.Velocities[i] = Tensor.Sum(
+                target - current, axis=0, keepDim=False
+            ) / Tensor.Sum(time, axis=0, keepDim=False)
+        self.RootControl.Velocities = Vector3.Lerp(
+            self.RootControl.Velocities,
+            self.Sequence.Trajectory.Velocities,
+            self.TrajectoryCorrection,
+        )
+
+
+def build_path(meta, arrays, warnings):
+    """The demo Path object for CURVE / PLANNER modes (None otherwise)."""
     from PathPlanner3D import Path as SplinePath
     from PathPlanner3D import PathPlanner3D
 
     mode = meta["path_mode"]
-    end = meta.get("end_behavior", exchange.END_STOP)
     if mode == exchange.PATH_CURVE:
-        return PathFollower(SplinePath(arrays["path_points"]), end)
+        return SplinePath(arrays["path_points"])
     if mode == exchange.PATH_PLANNER:
         cfg = meta["planner"]
         centers = arrays.get("obstacle_centers", np.zeros((0, 3)))
@@ -214,7 +376,7 @@ def build_follower(meta, arrays, warnings):
                     "Planner could not reach the goal within max depth; the last "
                     "segment ignores obstacles. Increase Max Depth or the grid size."
                 )
-        return PathFollower(path, end)
+        return path
     return None
 
 
@@ -332,15 +494,37 @@ def run(repo, request_path, result_path):
     style_indices = np.asarray(arrays["style_indices"], dtype=int)
     styles = resolve_guidances(controller, meta, arrays)
 
-    follower = build_follower(meta, arrays, warnings)
-    walked = 0.0
-
     def goal_at(frame, walked_distance):
         if follower is None:
             return np.asarray(arrays["goals"][frame], dtype=np.float32)
         return np.asarray(follower.goal(walked_distance), dtype=np.float32)
 
-    initialize_state(controller, profile, meta, arrays, goal_at(0, 0.0))
+    mode = meta["path_mode"]
+    control = meta.get("controller", exchange.CONTROLLER_GOAL)
+    end_behavior = meta.get("end_behavior", exchange.END_STOP)
+    path = build_path(meta, arrays, warnings)
+    follower = PathFollower(path, end_behavior) if path is not None else None
+    if mode == exchange.PATH_STICK:
+        first_goal = np.asarray(arrays.get("start_transform", np.eye(4)), dtype=np.float32)
+    elif follower is not None:
+        first_goal = np.asarray(follower.goal(0.0), dtype=np.float32)
+    else:
+        first_goal = np.asarray(arrays["goals"][0], dtype=np.float32)
+    initialize_state(controller, profile, meta, arrays, first_goal)
+
+    reference = None
+    tracker = None
+    if control == exchange.CONTROLLER_STICK:
+        controller.Control = types.MethodType(stick_control, controller)
+        cfg = dict(exchange.DEFAULT_TRACKING, **meta.get("tracking", {}))
+        assist = bool(cfg["assist"])
+        tracker = ReferenceTracker(cfg["gain"])
+        leash = float(cfg["leash"])
+        if path is not None:
+            reference = PathReference(path, end_behavior, leash, cfg["gain"])
+        # Start the stick's ghost where the actor really starts (initial pose may differ).
+        ghost = np.array(controller.Actor.GetRootPosition(), dtype=float).reshape(3)
+    facing_mode = meta.get("facing_mode", exchange.FACING_MOVE)
 
     joints = profile.bone_count
     out_transforms = np.zeros((frames, joints, 4, 4))
@@ -348,45 +532,103 @@ def run(repo, request_path, result_path):
     out_roots = np.zeros((frames, 4, 4))
     out_goals = np.zeros((frames, 4, 4))
     out_contacts = np.zeros((frames, len(controller.ContactBones)))
+    out_commands = np.zeros((frames, 3))
+    out_facings = np.zeros((frames, 3))
 
-    def record(frame, goal):
+    def record(frame, goal, command=None, facing=None):
         out_transforms[frame] = controller.Actor.Transforms
         out_velocities[frame] = controller.Actor.Velocities
         out_roots[frame] = controller.Actor.Root
         out_goals[frame] = goal
         out_contacts[frame] = current_contacts(controller, prediction_fps)
+        if command is not None:
+            out_commands[frame] = command
+            out_facings[frame] = facing
+
+    def stick_command(frame, speed):
+        """(velocity, facing) of the virtual left/right sticks for one sub-step."""
+        nonlocal ghost
+        root = np.array(controller.Actor.GetRootPosition(), dtype=float).reshape(3)
+        if reference is not None:
+            velocity, _ = reference.command(root, speed, dt)
+        elif mode == exchange.PATH_TARGET:
+            target = np.asarray(arrays["goals"][frame][:3, 3], dtype=float)
+            previous = np.asarray(arrays["goals"][max(frame - 1, 0)][:3, 3], dtype=float)
+            velocity = tracker.command(target, (target - previous) * fps, root)
+        else:
+            stick = np.array(arrays["move_sticks"][frame], dtype=float)
+            stick[1] = 0.0
+            length = float(np.linalg.norm(stick))
+            stick = stick / length if length > 1.0 else stick
+            if assist:
+                # Integrate the stick into a ghost position on a leash and track it.
+                ghost = ghost + speed * stick * dt
+                offset = ghost - root
+                offset[1] = 0.0
+                if np.linalg.norm(offset) > leash:
+                    ghost = root + offset / np.linalg.norm(offset) * leash
+                velocity = tracker.command(ghost, speed * stick, root)
+            else:
+                velocity = speed * stick  # exactly the gamepad demo
+        if facing_mode == exchange.FACING_LOOK_AT:
+            facing = np.array(arrays["facing_points"][frame], dtype=float) - root
+            facing[1] = 0.0
+            if np.linalg.norm(facing) < 0.05:
+                facing = np.zeros(3)
+        elif facing_mode == exchange.FACING_DIRECTION:
+            facing = np.array(arrays["facing_directions"][frame], dtype=float)
+            facing[1] = 0.0
+        else:
+            facing = np.zeros(3)
+        return velocity, facing, (velocity.astype(np.float32), facing.astype(np.float32))
 
     class _Stepper:
         # AI4Animation.Update advances Time *before* calling Program.Update,
         # exactly like the standalone demo loop.
-        goal = None
+        command = None
         guidance = None
 
         def Update(self):
-            controller.Update(self.goal, strength, self.guidance, Time.DeltaTime, prediction_fps)
+            controller.Update(self.command, strength, self.guidance, Time.DeltaTime, prediction_fps)
 
     stepper = _Stepper()
     AI4Animation.Program = stepper
 
-    record(0, goal_at(0, 0.0))
+    walked = 0.0
+    record(0, first_goal, np.zeros(3), np.zeros(3))
     for frame in range(1, frames):
         speed = float(speeds[frame])
         stepper.guidance = styles[style_indices[frame]]
+        command = facing = None
         for _ in range(substeps):
-            walked += speed * dt
-            stepper.goal = goal_at(frame, walked)
+            if control == exchange.CONTROLLER_STICK:
+                command, facing, stepper.command = stick_command(frame, speed)
+            else:
+                walked += speed * dt
+                stepper.command = goal_at(frame, walked)
             AI4Animation.Update(dt)
-        record(frame, stepper.goal)
+        if control == exchange.CONTROLLER_STICK:
+            # "Goal" of a stick controller: where its simulated trajectory ends (0.5 s ahead)
+            goal = np.array(controller.SimulationObject.Transforms[-1], dtype=float)
+        else:
+            goal = stepper.command
+        record(frame, goal, command, facing)
         if frame % max(1, frames // 10) == 0:
             log("frame %d / %d" % (frame, frames))
 
-    path_points = follower.sampled_points() if follower is not None else out_goals[:, :3, 3]
+    if reference is not None:
+        path_points = reference.sampled_points()
+    elif follower is not None:
+        path_points = follower.sampled_points()
+    else:
+        path_points = out_goals[:, :3, 3]
     exchange.save_result(
         result_path,
         {
             "fps": fps,
             "frame_count": frames,
             "substeps": substeps,
+            "controller": control,
             "bone_names": profile.bone_names,
             "contact_bones": profile.contact_bones,
             "warnings": warnings,
@@ -398,6 +640,8 @@ def run(repo, request_path, result_path):
         goals=out_goals,
         contacts=out_contacts,
         path_points=path_points,
+        commands=out_commands,
+        facings=out_facings,
     )
     log("done: %d frames in %.1fs (%d substeps)" % (frames, time.time() - started, substeps))
     for w in warnings:

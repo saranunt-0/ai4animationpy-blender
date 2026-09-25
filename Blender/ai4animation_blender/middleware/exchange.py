@@ -6,41 +6,72 @@ Both files are .npz archives. Every array is in AI4Animation world space
 this boundary. A JSON "meta" entry carries scalars and names.
 
 Request (Blender -> runner)
-    meta.version, fps, frame_count, bone_names, path_mode, control_strength,
-    prediction_fps, end_behavior, style_names, idle_style, network_iterations,
+    meta.version, fps, frame_count, bone_names, path_mode, controller,
+    control_strength, prediction_fps, end_behavior, style_names, idle_style,
+    network_iterations, facing_mode, tracking {gain, leash, assist},
     planner {center, size, resolution, max_depth}
-    speeds              (F,)        walk speed per frame, m/s
+    speeds              (F,)        walk speed per frame, m/s (stick: speed at full deflection)
     style_indices       (F,)        index into style_names per frame
     path_points         (N, 3)      path_mode == "CURVE"
     start, goal         (3,)        path_mode == "PLANNER"
     obstacle_centers    (M, 3)      path_mode == "PLANNER"
     obstacle_sizes      (M, 3)
     goals               (F, 4, 4)   path_mode == "TARGET"
+    move_sticks         (F, 3)      path_mode == "STICK": left stick in world space, |v| <= 1
+    start_transform     (4, 4)      path_mode == "STICK": where the character starts
+    facing_points       (F, 3)      facing_mode == "LOOK_AT"
+    facing_directions   (F, 3)      facing_mode == "DIRECTION" (right stick; zero = movement)
     initial_transforms  (J, 4, 4)   optional start pose
     initial_velocities  (J, 3)      optional
     initial_root        (4, 4)      optional
     custom_guidances    (K, J, 3)   optional, referenced as "custom:<i>" in style_names
 
+Controllers
+    GOAL   Demos/Authoring: SimulationObject.ControlFromTarget(goal). Faces
+           the movement direction.
+    STICK  Demos/Locomotion/Biped (the original gamepad control):
+           SimulationObject.Control(position, direction, velocity) with
+           velocity = left stick and direction = right stick. A virtual
+           player produces the left stick by tracking a reference that moves
+           at the keyed speed along a path, follows a target, or integrates
+           keyed stick objects; the right stick comes from facing_mode.
+
 Result (runner -> Blender)
-    meta.version, fps, frame_count, bone_names, warnings
+    meta.version, fps, frame_count, bone_names, controller, warnings
     transforms          (F, J, 4, 4)
     velocities          (F, J, 3)
     roots               (F, 4, 4)
-    goals               (F, 4, 4)
+    goals               (F, 4, 4)   goal (GOAL) or end of the simulated trajectory (STICK)
     contacts            (F, C)      contact bones in meta.contact_bones
     path_points         (N, 3)      the path actually followed
+    commands, facings   (F, 3)      velocity command (m/s) and facing used (STICK)
 """
 
 import json
 
 import numpy as np
 
-VERSION = 1
+VERSION = 2
 
 PATH_CURVE = "CURVE"
 PATH_PLANNER = "PLANNER"
 PATH_TARGET = "TARGET"
-PATH_MODES = (PATH_CURVE, PATH_PLANNER, PATH_TARGET)
+PATH_STICK = "STICK"
+PATH_MODES = (PATH_CURVE, PATH_PLANNER, PATH_TARGET, PATH_STICK)
+
+CONTROLLER_GOAL = "GOAL"
+CONTROLLER_STICK = "STICK"
+CONTROLLERS = (CONTROLLER_GOAL, CONTROLLER_STICK)
+
+FACING_MOVE = "MOVE"
+FACING_LOOK_AT = "LOOK_AT"
+FACING_DIRECTION = "DIRECTION"
+FACING_MODES = (FACING_MOVE, FACING_LOOK_AT, FACING_DIRECTION)
+
+# Joystick controller's virtual player: position gain (1/s), max distance of the
+# reference ahead of the character (m), assist = track a moving reference
+# (exact speeds) instead of feeding raw stick velocities.
+DEFAULT_TRACKING = {"gain": 2.0, "leash": 1.0, "assist": True}
 
 END_STOP = "STOP"
 END_PINGPONG = "PINGPONG"
@@ -57,6 +88,10 @@ REQUEST_ARRAYS = {
     "obstacle_centers": 2,
     "obstacle_sizes": 2,
     "goals": 3,
+    "move_sticks": 2,
+    "start_transform": 2,
+    "facing_points": 2,
+    "facing_directions": 2,
     "initial_transforms": 3,
     "initial_velocities": 2,
     "initial_root": 2,
@@ -70,6 +105,8 @@ RESULT_ARRAYS = {
     "goals": 3,
     "contacts": 2,
     "path_points": 2,
+    "commands": 2,
+    "facings": 2,
 }
 
 
@@ -110,6 +147,22 @@ def validate_request(meta, arrays):
     mode = meta.get("path_mode")
     if mode not in PATH_MODES:
         errors.append("path_mode must be one of %s" % (PATH_MODES,))
+    control = meta.get("controller", CONTROLLER_GOAL)
+    if control not in CONTROLLERS:
+        errors.append("controller must be one of %s" % (CONTROLLERS,))
+    if control == CONTROLLER_GOAL and mode == PATH_STICK:
+        errors.append("path_mode STICK needs controller STICK")
+    facing = meta.get("facing_mode", FACING_MOVE)
+    if facing not in FACING_MODES:
+        errors.append("facing_mode must be one of %s" % (FACING_MODES,))
+    if facing != FACING_MOVE and control != CONTROLLER_STICK:
+        errors.append("facing_mode %s needs controller STICK" % facing)
+    for key, needed in (("facing_points", FACING_LOOK_AT), ("facing_directions", FACING_DIRECTION)):
+        if facing == needed and (key not in arrays or arrays[key].shape != (frames, 3)):
+            errors.append("facing_mode %s needs %s with shape (%d, 3)" % (needed, key, frames))
+    tracking = meta.get("tracking", {})
+    if float(tracking.get("gain", 1.0)) < 0.0 or float(tracking.get("leash", 1.0)) <= 0.0:
+        errors.append("tracking gain must be >= 0 and leash > 0")
     if meta.get("end_behavior", END_STOP) not in END_BEHAVIORS:
         errors.append("end_behavior must be one of %s" % (END_BEHAVIORS,))
     for key in ("speeds", "style_indices"):
@@ -132,6 +185,14 @@ def validate_request(meta, arrays):
             errors.append("PLANNER mode needs meta.planner")
     if mode == PATH_TARGET and ("goals" not in arrays or arrays["goals"].shape != (frames, 4, 4)):
         errors.append("TARGET mode needs goals with shape (%d, 4, 4)" % frames)
+    if mode == PATH_STICK:
+        sticks = arrays.get("move_sticks")
+        if sticks is None or sticks.shape != (frames, 3):
+            errors.append("STICK mode needs move_sticks with shape (%d, 3)" % frames)
+        elif np.linalg.norm(sticks, axis=-1).max(initial=0.0) > 1.0 + 1e-6:
+            errors.append("move_sticks must have length <= 1")
+        if "start_transform" in arrays and arrays["start_transform"].shape != (4, 4):
+            errors.append("start_transform must have shape (4, 4)")
     if "initial_transforms" in arrays and arrays["initial_transforms"].shape != (joints, 4, 4):
         errors.append("initial_transforms must have shape (%d, 4, 4)" % joints)
     if "initial_velocities" in arrays and arrays["initial_velocities"].shape != (joints, 3):

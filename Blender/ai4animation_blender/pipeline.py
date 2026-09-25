@@ -151,6 +151,40 @@ def style_timeline(settings, frames):
     return names, idle, indices, (np.stack(customs) if customs else None)
 
 
+# Blender facing options -> exchange facing modes
+FACING_TO_EXCHANGE = {
+    "MOVE": exchange.FACING_MOVE,
+    "LOOK_AT": exchange.FACING_LOOK_AT,
+    "OBJECT": exchange.FACING_DIRECTION,
+    "STICK": exchange.FACING_DIRECTION,
+}
+
+
+def resolve_controller(settings):
+    """Pick the controller that serves the request best.
+
+    Measured on S-curve / corner / hairpin paths: with the character facing
+    where it walks, the Authoring goal controller follows paths tighter and
+    smoother. Facing control (look-at, object, right stick) and keyed stick
+    input need the gamepad controller (Demos/Locomotion/Biped).
+    """
+    needs_stick = settings.path_mode == exchange.PATH_STICK or settings.facing_mode != "MOVE"
+    if settings.controller == "AUTO":
+        return exchange.CONTROLLER_STICK if needs_stick else exchange.CONTROLLER_GOAL
+    if settings.controller == exchange.CONTROLLER_GOAL and needs_stick:
+        raise PipelineError(
+            "The goal controller always faces where it walks and has no joystick input. "
+            "Use Controller 'Auto' or 'Joystick'."
+        )
+    return settings.controller
+
+
+def knob_and_gate(obj, label):
+    if obj is None:
+        raise PipelineError("Pick the %s knob (use 'Create Helpers')." % label)
+    return obj, obj.parent  # no parent: the world origin is the gate
+
+
 def build_request(context):
     scene = context.scene
     settings = scene.ai4a
@@ -163,11 +197,19 @@ def build_request(context):
     mpu = bio.meters_per_unit(scene)
 
     style_names, idle, style_indices, customs = style_timeline(settings, frames)
+    controller = resolve_controller(settings)
     meta = {
         "fps": fps,
         "frame_count": int(len(frames)),
         "bone_names": profile.bone_names,
         "path_mode": settings.path_mode,
+        "controller": controller,
+        "facing_mode": FACING_TO_EXCHANGE[settings.facing_mode],
+        "tracking": {
+            "gain": settings.tracking_gain,
+            "leash": settings.tracking_leash * mpu,
+            "assist": settings.stick_assist,
+        },
         "control_strength": settings.control_strength,
         "prediction_fps": settings.prediction_fps,
         "end_behavior": settings.end_behavior,
@@ -211,11 +253,34 @@ def build_request(context):
             "max_depth": settings.planner_max_depth,
         }
         arrays.update(start=start, goal=goal, obstacle_centers=centers, obstacle_sizes=sizes)
-    else:
+    # Everything animated is sampled in one pass over the frames.
+    sampled = {}
+    if mode == exchange.PATH_TARGET:
         if settings.target_object is None:
             raise PipelineError("Pick a target object to follow.")
-        mats = bio.sample_world_matrices(scene, settings.target_object, frames)
-        arrays["goals"] = cv.object_frames_blender_to_ai4a(mats, mpu)
+        sampled["target"] = settings.target_object
+    if mode == exchange.PATH_STICK:
+        sampled["left_knob"], sampled["left_gate"] = knob_and_gate(settings.left_stick, "left stick")
+    if settings.facing_mode == "STICK":
+        sampled["right_knob"], sampled["right_gate"] = knob_and_gate(settings.right_stick, "right stick")
+    elif settings.facing_mode in ("LOOK_AT", "OBJECT"):
+        if settings.facing_object is None:
+            raise PipelineError("Pick the facing object.")
+        sampled["facing"] = settings.facing_object
+    keys = list(sampled)
+    mats = dict(zip(keys, bio.sample_world_matrices_many(scene, [sampled[k] for k in keys], frames)))
+
+    if mode == exchange.PATH_TARGET:
+        arrays["goals"] = cv.object_frames_blender_to_ai4a(mats["target"], mpu)
+    if mode == exchange.PATH_STICK:
+        arrays["move_sticks"] = features.stick_from_knob(mats["left_gate"], mats["left_knob"][:, :3, 3])
+        arrays["start_transform"] = start_transform(scene, settings, arm, calibration, profile, frames[0], mpu)
+    if settings.facing_mode == "STICK":
+        arrays["facing_directions"] = features.stick_from_knob(mats["right_gate"], mats["right_knob"][:, :3, 3])
+    elif settings.facing_mode == "LOOK_AT":
+        arrays["facing_points"] = cv.points_blender_to_ai4a(mats["facing"][:, :3, 3], mpu)
+    elif settings.facing_mode == "OBJECT":
+        arrays["facing_directions"] = features.facing_from_objects(mats["facing"], mpu)
 
     if settings.start_from_pose:
         current = scene.frame_current
@@ -231,6 +296,20 @@ def build_request(context):
         arrays["initial_root"] = features.compute_root(pose, profile)
 
     return meta, arrays, frames
+
+
+def start_transform(scene, settings, arm, calibration, profile, frame, mpu):
+    """Where a joystick-driven character starts: the Start object, else where it stands."""
+    if settings.start_object is not None:
+        m = bio.sample_world_matrices(scene, settings.start_object, [frame])[0]
+        return cv.object_frames_blender_to_ai4a(m, mpu)
+    current = scene.frame_current
+    try:
+        scene.frame_set(int(frame))
+        pose = calibration.to_ai4a(bio.snapshot_armature(arm, scene))
+    finally:
+        scene.frame_set(current)
+    return features.compute_root(pose, profile)
 
 
 def write_request(context, work_dir):

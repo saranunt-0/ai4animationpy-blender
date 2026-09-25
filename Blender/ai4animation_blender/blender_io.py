@@ -124,15 +124,26 @@ def object_world_corners(obj):
 
 
 def sample_world_matrices(scene, obj, frames):
+    return sample_world_matrices_many(scene, [obj], frames)[0]
+
+
+def sample_world_matrices_many(scene, objects, frames):
+    """World matrices (F, 4, 4) of several objects in ONE pass over the frames.
+
+    frame_set evaluates the whole scene (including the skinned character), so
+    sampling every object separately would multiply the cost. None entries
+    yield identity matrices (e.g. a joystick knob without a gate parent).
+    """
     current = scene.frame_current
-    out = []
+    out = [[] for _ in objects]
     try:
         for f in frames:
             scene.frame_set(int(f))
-            out.append(np.array(obj.matrix_world))
+            for i, obj in enumerate(objects):
+                out[i].append(np.eye(4) if obj is None else np.array(obj.matrix_world))
     finally:
         scene.frame_set(current)
-    return np.array(out)
+    return [np.array(m) for m in out]
 
 
 def sample_property(owner, prop, frames, id_data=None):

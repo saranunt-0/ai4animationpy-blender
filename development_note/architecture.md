@@ -36,3 +36,6 @@ blender_io.py     │ middleware (pure NumPy)          MotionController, PathPla
    is re-evaluated and compared with the model (self-check in the operator report).
 4. **Reuse the demo controller as-is.** The runner only wraps it with shims
    (CPU `map_location`, cwd for `Guidances/`, in-place initial pose).
+5. **Two controllers, chosen automatically.** Goal (Authoring) for path following
+   with natural facing, because it measured best. Joystick (Biped `Control()`) with a
+   virtual player (reference tracking) for facing control and keyed virtual sticks.

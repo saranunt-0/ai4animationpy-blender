@@ -128,7 +128,7 @@ def _request(path, profile, frames, **overrides):
     }
     meta.update(overrides.pop("meta", {}))
     arrays.update(overrides)
-    exchange.save_request(path, meta, **arrays)
+    exchange.save_request(path, meta, **{k: v for k, v in arrays.items() if v is not None})
 
 
 def _run(tmp_path, request):
@@ -181,3 +181,82 @@ def test_runner_target_mode(tmp_path, profile):
     meta, res = _run(tmp_path, req)
     assert res["transforms"].shape == (frames, profile.bone_count, 4, 4)
     assert res["roots"][-1, 0, 3] > 0.5  # moved towards +X
+
+
+def _stick_request(path, profile, frames, **overrides):
+    meta = {"controller": exchange.CONTROLLER_STICK}
+    meta.update(overrides.pop("meta", {}))
+    _request(path, profile, frames, meta=meta, **overrides)
+
+
+def test_stick_controller_walks_backwards(tmp_path, profile):
+    frames = 24 * 6
+    req = tmp_path / "req.npz"
+    x = np.tile([1.0, 0.0, 0.0], (frames, 1))
+    _stick_request(
+        req, profile, frames,
+        meta={"path_mode": exchange.PATH_STICK, "facing_mode": exchange.FACING_DIRECTION},
+        path_points=None, move_sticks=x, facing_directions=-x, start_transform=np.eye(4),
+    )
+    meta, res = _run(tmp_path, req)
+    assert meta["controller"] == exchange.CONTROLLER_STICK
+    roots = res["roots"][48:]
+    velocity = np.diff(roots[:, :3, 3], axis=0) * 24.0
+    assert velocity[:, 0].mean() > 0.7  # moves along +X at ~1 m/s
+    assert (roots[:, :3, 2] @ np.array([-1.0, 0.0, 0.0])).mean() > 0.95  # while facing -X
+
+
+def test_stick_controller_follows_path_and_settles(tmp_path, profile):
+    # Short straight path at 1 m/s: a raw stick push this gentle never starts
+    # walking from standing; the tracking virtual player must.
+    frames = 24 * 8
+    req = tmp_path / "req.npz"
+    _stick_request(req, profile, frames)  # CURVE (-1,-1) -> (1,1)
+    meta, res = _run(tmp_path, req)
+    root = res["roots"][:, :3, 3]
+    end = np.array([1.0, 0.0, 1.0])
+    assert np.linalg.norm(root[-1] - end) < 0.35
+    last_second = np.linalg.norm(np.diff(root[-24:], axis=0), axis=-1).sum()
+    assert last_second < 0.2  # settled, not orbiting the end point
+    assert np.linalg.norm(res["commands"], axis=-1).max() <= 3.0 + 1e-6
+
+
+@pytest.mark.parametrize("speed", [0.6, 1.0])
+def test_stick_assist_holds_slow_speeds_from_standing(tmp_path, profile, speed):
+    frames = 24 * 5
+    req = tmp_path / "req.npz"
+    z = np.tile([0.0, 0.0, 1.0], (frames, 1))
+    _stick_request(
+        req, profile, frames, meta={"path_mode": exchange.PATH_STICK},
+        path_points=None, move_sticks=z, start_transform=np.eye(4), speeds=np.full(frames, speed),
+    )
+    meta, res = _run(tmp_path, req)
+    z_root = res["roots"][:, 2, 3]
+    assert abs((z_root[-1] - z_root[-49]) / 2.0 - speed) < 0.15  # steady speed over the last 2 s
+
+
+def test_stick_controller_chases_target(tmp_path, profile):
+    frames = 24 * 5
+    goals = np.repeat(np.eye(4)[None], frames, 0)
+    goals[:, 0, 3] = 3.0  # stationary target 3 m along +X
+    req = tmp_path / "req.npz"
+    _stick_request(req, profile, frames, meta={"path_mode": exchange.PATH_TARGET}, goals=goals)
+    meta, res = _run(tmp_path, req)
+    assert res["roots"][-1, 0, 3] > 2.3
+
+
+def test_stick_ghost_starts_at_initial_pose(tmp_path, profile):
+    # Start pose 2 m away from start_transform, stick centered: the virtual
+    # player must not drag the character back to start_transform.
+    frames = 48
+    req = tmp_path / "req.npz"
+    ref = np.asarray(profile.reference_transforms, float)
+    start = features.root_from_position_direction([2.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+    pose = features.reroot(ref, features.compute_root(ref, profile), start)
+    _stick_request(
+        req, profile, frames, meta={"path_mode": exchange.PATH_STICK},
+        path_points=None, move_sticks=np.zeros((frames, 3)), start_transform=np.eye(4),
+        initial_transforms=pose, initial_root=start,
+    )
+    meta, res = _run(tmp_path, req)
+    assert np.linalg.norm(res["roots"][-1, :3, 3] - np.array([2.0, 0.0, 0.0])) < 0.2

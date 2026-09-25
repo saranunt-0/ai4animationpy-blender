@@ -116,3 +116,51 @@ def test_target_mode(scene, start_from_pose):
         scene.frame_set(1)
         forward = -np.array(root.matrix_world.col[1][:3])
         assert forward @ np.array([0.0, -1.0, 0.0]) > 0.99
+
+
+def _key_knob(knob, frames, xy):
+    for frame in frames:
+        knob.location = (xy[0], xy[1], 0.0)
+        knob.keyframe_insert("location", frame=frame)
+
+
+def test_virtual_joystick_walks_backwards(scene):
+    arm = _import("GLB")
+    s = scene.ai4a
+    s.path_mode = "STICK"
+    s.facing_mode = "STICK"
+    assert bpy.ops.ai4a.setup_helpers() == {"FINISHED"}
+    assert s.left_stick.parent is not None and s.right_stick.parent is not None
+    _key_knob(s.left_stick, (1, 73), (0.0, 1.0))  # stick up = Blender +Y
+    _key_knob(s.right_stick, (1, 73), (0.0, -1.0))  # face Blender -Y
+    _check_against_model(scene, bpy.ops.ai4a.generate())
+    start, end = _hips_world(arm, 25), _hips_world(arm, 73)
+    assert end[1] - start[1] > 1.2  # walked towards +Y ...
+    root = bpy.data.objects["AI4A_Root"]
+    scene.frame_set(60)
+    forward = -np.array(root.matrix_world.col[1][:3])
+    assert forward @ np.array([0.0, -1.0, 0.0]) > 0.9  # ... while facing -Y: backwards
+
+
+def test_curve_with_look_at_uses_joystick_controller(scene):
+    from ai4animation_blender import pipeline
+
+    _import("GLB")
+    s = scene.ai4a
+    s.path_mode = "CURVE"
+    s.facing_mode = "LOOK_AT"
+    assert bpy.ops.ai4a.setup_helpers() == {"FINISHED"}
+    assert pipeline.resolve_controller(s) == "STICK"
+    s.facing_object.location = (3.0, 3.0, 0.0)
+    _check_against_model(scene, bpy.ops.ai4a.generate())
+    s.controller = "GOAL"
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.resolve_controller(s)
+    s.controller = "AUTO"
+    s.facing_mode = "MOVE"
+    assert pipeline.resolve_controller(s) == "GOAL"
+
+
+def test_default_style_is_neutral(scene):
+    assert scene.ai4a.style == "Neutral"
+    assert scene.ai4a.idle_style == "Idle"

@@ -61,12 +61,14 @@ def addon():
     addon_utils.disable(ADDON)
 
 
-@pytest.mark.parametrize("mode", ["CURVE", "PLANNER", "TARGET"])
-def test_panels_draw(addon, mode):
+@pytest.mark.parametrize("facing", ["MOVE", "LOOK_AT", "OBJECT", "STICK"])
+@pytest.mark.parametrize("mode", ["CURVE", "PLANNER", "TARGET", "STICK"])
+def test_panels_draw(addon, mode, facing):
     from ai4animation_blender import ui
 
     scene = bpy.context.scene
     scene.ai4a.path_mode = mode
+    scene.ai4a.facing_mode = facing
     scene.ai4a.use_scene_range = False
     scene.ai4a.status = "status"
     arm = bpy.data.objects.new("Arm", bpy.data.armatures.new("Arm"))

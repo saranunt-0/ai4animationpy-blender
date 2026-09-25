@@ -341,3 +341,61 @@ def test_exchange_rejects_bad_requests(tmp_path, profile):
             tmp_path / "c.npz", dict(_meta(profile), style_names=["Neutral"], path_mode="TARGET"),
             speeds=np.ones(5), style_indices=np.zeros(5, int),
         )
+
+
+# ----------------------------------------------------------------------------
+# Virtual joystick
+# ----------------------------------------------------------------------------
+
+
+def test_stick_up_matches_gamepad_demo_convention():
+    # Gamepad demo: stick up -> velocity AI4A -Z, stick right -> AI4A +X.
+    # Default gate (identity) in Blender: stick up = knob at +Y.
+    gate = np.eye(4)[None]
+    up = features.stick_from_knob(gate, [[0.0, 1.0, 0.0]])
+    right = features.stick_from_knob(gate, [[1.0, 0.0, 0.0]])
+    assert np.allclose(up, [[0.0, 0.0, -1.0]])
+    assert np.allclose(right, [[1.0, 0.0, 0.0]])
+
+
+def test_stick_clamps_uses_gate_frame_and_ignores_height():
+    gate = tr(rotation_about([0, 0, 1], 90.0), [5.0, 5.0, 2.0])
+    gate[:3, :3] *= 2.0  # gate scaled x2: radius 2 BU == full stick
+    knob = [[5.0 - 1.0, 5.0, 2.3]]  # 1 BU along gate +Y (rotated to world -X), 0.3 up
+    s = features.stick_from_knob(gate[None], knob)
+    assert np.allclose(np.linalg.norm(s), 0.5)
+    assert np.allclose(s[0] / 0.5, cv.directions_blender_to_ai4a([-1.0, 0.0, 0.0]))
+    far = features.stick_from_knob(np.eye(4)[None], [[3.0, 4.0, 0.0]])
+    assert np.isclose(np.linalg.norm(far), 1.0)
+    assert np.allclose(features.stick_from_knob(np.eye(4)[None], [[0.0, 0.0, 0.7]]), 0.0)
+
+
+def test_facing_from_objects_uses_minus_y():
+    m = tr(rotation_about([0, 0, 1], 90.0), [1.0, 2.0, 3.0])  # -Y rotated to Blender +X
+    d = features.facing_from_objects(m[None])
+    assert np.allclose(d, [[1.0, 0.0, 0.0]])
+    assert np.allclose(features.facing_from_objects(np.eye(4)[None]), [[0.0, 0.0, 1.0]])
+
+
+def test_exchange_stick_requests(tmp_path, profile):
+    base = dict(_meta(profile), style_names=["Neutral"], controller=exchange.CONTROLLER_STICK)
+    common = dict(speeds=np.ones(5), style_indices=np.zeros(5, int))
+    exchange.save_request(
+        tmp_path / "ok.npz", dict(base, path_mode=exchange.PATH_STICK, facing_mode=exchange.FACING_DIRECTION),
+        move_sticks=np.zeros((5, 3)), facing_directions=np.zeros((5, 3)), start_transform=np.eye(4), **common,
+    )
+    with pytest.raises(ValueError, match="length <= 1"):
+        exchange.save_request(
+            tmp_path / "a.npz", dict(base, path_mode=exchange.PATH_STICK),
+            move_sticks=np.full((5, 3), 2.0), **common,
+        )
+    with pytest.raises(ValueError, match="needs controller STICK"):
+        exchange.save_request(
+            tmp_path / "b.npz", dict(base, controller=exchange.CONTROLLER_GOAL, path_mode=exchange.PATH_STICK),
+            move_sticks=np.zeros((5, 3)), **common,
+        )
+    with pytest.raises(ValueError, match="facing_points"):
+        exchange.save_request(
+            tmp_path / "c.npz", dict(base, facing_mode=exchange.FACING_LOOK_AT),
+            path_points=np.zeros((3, 3)), **common,
+        )

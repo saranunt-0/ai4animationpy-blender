@@ -4,7 +4,7 @@ from pathlib import Path
 import bpy
 
 from . import blender_io as bio
-from . import preferences
+from . import pipeline, preferences
 
 
 class AI4A_UL_style_keys(bpy.types.UIList):
@@ -57,12 +57,13 @@ class AI4A_PT_main(_Panel, bpy.types.Panel):
 
 
 class AI4A_PT_path(_Panel, bpy.types.Panel):
-    bl_label = "Path"
+    bl_label = "Control"
     bl_parent_id = "AI4A_PT_main"
 
     def draw(self, context):
         layout = self.layout
         s = context.scene.ai4a
+        layout.label(text="Movement")
         layout.prop(s, "path_mode", expand=True)
         col = layout.column()
         if s.path_mode == "CURVE":
@@ -77,11 +78,39 @@ class AI4A_PT_path(_Panel, bpy.types.Panel):
             sub.prop(s, "planner_margin")
             sub.prop(s, "planner_height")
             sub.prop(s, "planner_max_depth")
-        else:
+        elif s.path_mode == "TARGET":
             col.prop(s, "target_object")
-            col.label(text="The target's -Y axis is its facing", icon="INFO")
-        if s.path_mode != "TARGET":
+        else:
+            col.prop(s, "left_stick")
+            col.prop(s, "start_object", text="Start (optional)")
+            col.prop(s, "stick_assist")
+            col.label(text="Key the knob inside its circle; circle radius = full stick", icon="INFO")
+        if s.path_mode in ("CURVE", "PLANNER"):
             col.prop(s, "end_behavior")
+
+        layout.label(text="Facing")
+        layout.prop(s, "facing_mode", text="")
+        if s.facing_mode == "STICK":
+            layout.prop(s, "right_stick")
+        elif s.facing_mode in ("LOOK_AT", "OBJECT"):
+            layout.prop(s, "facing_object")
+            if s.facing_mode == "OBJECT":
+                layout.label(text="The object's -Y axis is the facing", icon="INFO")
+
+        box = layout.box()
+        box.prop(s, "controller")
+        try:
+            resolved = pipeline.resolve_controller(s)
+            box.label(text="Using: %s" % ("Joystick (Biped demo)" if resolved == "STICK" else "Goal (Authoring demo)"))
+        except pipeline.PipelineError as error:
+            resolved = None
+            box.label(text=str(error)[:60], icon="ERROR")
+        if resolved == "STICK":
+            row = box.row(align=True)
+            row.prop(s, "tracking_gain")
+            row.prop(s, "tracking_leash")
+        elif resolved == "GOAL":
+            box.prop(s, "control_strength")
         layout.operator("ai4a.setup_helpers", icon="ADD")
 
 
@@ -127,7 +156,6 @@ class AI4A_PT_generate(_Panel, bpy.types.Panel):
             row.prop(s, "frame_start")
             row.prop(s, "frame_end")
         col.prop(s, "walk_speed")
-        col.prop(s, "control_strength")
         col.prop(s, "start_from_pose")
         col.prop(s, "location_mode")
         col.prop(s, "action_name")

@@ -181,11 +181,43 @@ class AI4A_OT_style_key_remove(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def create_stick(coll, name, location):
+    """Virtual joystick: a gate circle (radius 1 = full deflection) and a knob.
+
+    The knob is parented to the gate and constrained to stay inside the circle
+    and in its plane, so moving/keyframing it feels like pushing a stick.
+    Rotate the gate about Z to change which way is "stick up".
+    """
+    gate = bpy.data.objects.get(name + "_Gate") or bpy.data.objects.new(name + "_Gate", None)
+    gate.empty_display_type = "CIRCLE"
+    gate.empty_display_size = 1.0
+    gate.location = location
+    knob = bpy.data.objects.get(name) or bpy.data.objects.new(name, None)
+    knob.empty_display_type = "SPHERE"
+    knob.empty_display_size = 0.12
+    knob.parent = gate
+    knob.location = (0.0, 0.0, 0.0)
+    for obj in (gate, knob):
+        if obj.name not in coll.objects:
+            coll.objects.link(obj)
+    if not knob.constraints:
+        inside = knob.constraints.new("LIMIT_DISTANCE")
+        inside.target = gate
+        inside.distance = 1.0
+        inside.limit_mode = "LIMITDIST_INSIDE"
+        flat = knob.constraints.new("LIMIT_LOCATION")
+        flat.use_min_z = flat.use_max_z = True
+        flat.min_z = flat.max_z = 0.0
+        flat.owner_space = "LOCAL"
+    return knob
+
+
 class AI4A_OT_setup_helpers(bpy.types.Operator):
-    """Create the objects the selected path mode needs (curve, start/goal, obstacles, target)"""
+    """Create the objects the selected movement and facing modes need
+    (curve, start/goal, obstacles, target, joystick knobs, facing object)"""
 
     bl_idname = "ai4a.setup_helpers"
-    bl_label = "Create Path Helpers"
+    bl_label = "Create Helpers"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -228,6 +260,13 @@ class AI4A_OT_setup_helpers(bpy.types.Operator):
                 s.obstacles = obstacles
         elif s.path_mode == "TARGET" and s.target_object is None:
             s.target_object = empty("AI4A_Target", (0, 0, 0), "SINGLE_ARROW")
+        elif s.path_mode == "STICK" and s.left_stick is None:
+            s.left_stick = create_stick(coll, "AI4A_LeftStick", (-1.5, -3.0, 0.0))
+
+        if s.facing_mode == "STICK" and s.right_stick is None:
+            s.right_stick = create_stick(coll, "AI4A_RightStick", (1.5, -3.0, 0.0))
+        elif s.facing_mode in ("LOOK_AT", "OBJECT") and s.facing_object is None:
+            s.facing_object = empty("AI4A_Facing", (0.0, -4.0, 0.0), "ARROWS")
         return {"FINISHED"}
 
 

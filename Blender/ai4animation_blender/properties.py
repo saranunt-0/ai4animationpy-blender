@@ -9,7 +9,9 @@ from .middleware import exchange, rig
 SHIPPED_PROFILE = Path(__file__).resolve().parent / "profiles" / "geno_profile.json"
 
 _enum_cache = []  # Blender requires dynamic enum item strings to stay referenced
+_main_cache = []
 _idle_cache = []
+DEFAULT_STYLE = "Neutral"
 
 
 def get_profile(scene):
@@ -37,11 +39,18 @@ def style_items(self, context):
     return _enum_cache
 
 
+def _first(items, name):
+    """Dynamic enums default to their first item: move `name` to the front."""
+    return sorted(items, key=lambda item: item[0] != name)
+
+
+def main_style_items(self, context):
+    _main_cache[:] = _first(style_items(self, context), DEFAULT_STYLE)
+    return _main_cache
+
+
 def idle_items(self, context):
-    """Same items with "Idle" first: dynamic enums default to their first item."""
-    items = list(style_items(self, context))
-    items.sort(key=lambda item: item[0] != "Idle")
-    _idle_cache[:] = items
+    _idle_cache[:] = _first(style_items(self, context), "Idle")
     return _idle_cache
 
 
@@ -72,13 +81,57 @@ class AI4A_Settings(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(name="Armature", type=bpy.types.Object, poll=_poll_armature)
 
     path_mode: bpy.props.EnumProperty(
-        name="Path",
+        name="Movement",
         items=(
-            (exchange.PATH_CURVE, "Curve", "Walk along a curve object"),
+            (exchange.PATH_CURVE, "Curve", "Walk along a curve object (e.g. a Bezier path)"),
             (exchange.PATH_PLANNER, "Planner", "Plan a path from Start to Goal around obstacle boxes"),
-            (exchange.PATH_TARGET, "Target", "Follow an animated object (its -Y axis is the facing)"),
+            (exchange.PATH_TARGET, "Target", "Follow an animated object"),
+            (exchange.PATH_STICK, "Joystick", "Keyframe a virtual left stick: a knob moving inside its gate circle"),
         ),
         default=exchange.PATH_CURVE,
+    )
+    facing_mode: bpy.props.EnumProperty(
+        name="Facing",
+        items=(
+            ("MOVE", "Movement", "Face where the character walks (right stick released)"),
+            ("LOOK_AT", "Look At", "Keep facing an object while walking (strafe / walk backwards)"),
+            ("OBJECT", "Object Axis", "Face along an object's -Y axis (Blender character forward)"),
+            ("STICK", "Right Stick", "Keyframe a virtual right stick knob; centered = face movement"),
+        ),
+        default="MOVE",
+    )
+    facing_object: bpy.props.PointerProperty(name="Facing Object", type=bpy.types.Object)
+    left_stick: bpy.props.PointerProperty(
+        name="Left Stick", type=bpy.types.Object,
+        description="Knob object; its offset inside its parent (gate, radius 1) is the stick deflection",
+    )
+    right_stick: bpy.props.PointerProperty(
+        name="Right Stick", type=bpy.types.Object,
+        description="Knob object; its offset inside its parent (gate) is the facing direction",
+    )
+    controller: bpy.props.EnumProperty(
+        name="Controller",
+        items=(
+            ("AUTO", "Auto", "Goal controller for paths facing the movement, joystick controller otherwise"),
+            (exchange.CONTROLLER_GOAL, "Goal", "Demos/Authoring: follow a goal moving along the path"),
+            (exchange.CONTROLLER_STICK, "Joystick", "Demos/Locomotion/Biped gamepad control (velocity + facing)"),
+        ),
+        default="AUTO",
+    )
+    stick_assist: bpy.props.BoolProperty(
+        name="Speed Assist", default=True,
+        description=(
+            "Track the position the stick implies so speeds are exact. Off = raw gamepad input "
+            "(below ~1 m/s the model may not start walking, as in the demo)"
+        ),
+    )
+    tracking_gain: bpy.props.FloatProperty(
+        name="Tracking Gain", default=2.0, min=0.0, soft_max=6.0,
+        description="Joystick controller: how strongly (1/s) the virtual player corrects position errors",
+    )
+    tracking_leash: bpy.props.FloatProperty(
+        name="Leash", default=1.0, min=0.1, soft_max=3.0, unit="LENGTH",
+        description="Joystick controller: how far the reference may run ahead of the character",
     )
     curve: bpy.props.PointerProperty(name="Curve", type=bpy.types.Object, poll=_poll_curve)
     path_spacing: bpy.props.FloatProperty(
@@ -99,7 +152,7 @@ class AI4A_Settings(bpy.types.PropertyGroup):
 
     walk_speed: bpy.props.FloatProperty(
         name="Walk Speed", default=1.0, min=0.0, soft_max=3.0, unit="VELOCITY",
-        description="Meters per second along the path (can be keyframed)",
+        description="Meters per second along the path, or at full stick deflection (can be keyframed)",
     )
     control_strength: bpy.props.FloatProperty(name="Control Strength", default=2.0, min=0.0, soft_max=5.0)
     end_behavior: bpy.props.EnumProperty(
@@ -108,7 +161,7 @@ class AI4A_Settings(bpy.types.PropertyGroup):
         default=exchange.END_STOP,
     )
 
-    style: bpy.props.EnumProperty(name="Style", items=style_items)
+    style: bpy.props.EnumProperty(name="Style", items=main_style_items)
     idle_style: bpy.props.EnumProperty(name="Idle Style", items=idle_items, description="Used when nearly standing still")
     style_keys: bpy.props.CollectionProperty(type=AI4A_StyleKey)
     style_key_index: bpy.props.IntProperty()

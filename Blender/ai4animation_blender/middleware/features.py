@@ -139,6 +139,44 @@ def blender_path_to_ai4a(points_blender_world, meters_per_unit=1.0, spacing=0.25
     return resample_polyline(pts, spacing)
 
 
+def stick_from_knob(gate_world, knob_positions):
+    """Virtual joystick: knob position inside its gate -> stick vector (AI4A world).
+
+    gate_world:     (F, 4, 4) Blender world matrix of the gate (a unit circle).
+    knob_positions: (F, 3) Blender world position of the knob.
+    The knob's offset in the gate's local XY plane is the stick deflection
+    (unit radius = full stick, clamped). The gate's orientation defines what
+    "stick up" means (+Y of the gate); by default that is Blender +Y, which is
+    also the gamepad demo convention (stick up = AI4Animation -Z).
+    Returns (F, 3) horizontal vectors with length <= 1.
+    """
+    gate = cv.as_matrix(gate_world).reshape(-1, 4, 4)
+    knob = cv.as_matrix(knob_positions).reshape(-1, 3)
+    local = np.einsum("fij,fj->fi", np.linalg.inv(gate), np.concatenate((knob, np.ones((knob.shape[0], 1))), axis=1))
+    stick = np.zeros((knob.shape[0], 3))
+    stick[:, :2] = local[:, :2]
+    length = np.linalg.norm(stick, axis=-1, keepdims=True)
+    stick = np.where(length > 1.0, stick / np.maximum(length, cv.EPS), stick)
+    magnitude = np.linalg.norm(stick, axis=-1)
+    rotation = cv.rigid(gate)[:, :3, :3]
+    world = np.einsum("fij,fj->fi", rotation, stick)  # Blender world direction
+    world[:, 2] = 0.0
+    norm = np.linalg.norm(world, axis=-1, keepdims=True)
+    world = np.where(norm > 1e-9, world / np.maximum(norm, cv.EPS), 0.0) * magnitude[:, None]
+    out = cv.directions_blender_to_ai4a(world)
+    out[:, 1] = 0.0
+    return out
+
+
+def facing_from_objects(world_matrices, meters_per_unit=1.0):
+    """Object facing (-Y axis, Blender character convention) -> AI4A horizontal directions."""
+    frames = cv.object_frames_blender_to_ai4a(world_matrices, meters_per_unit)
+    direction = frames[..., :3, 2].copy()
+    direction[..., 1] = 0.0
+    norm = np.linalg.norm(direction, axis=-1, keepdims=True)
+    return np.where(norm > 1e-9, direction / np.maximum(norm, cv.EPS), 0.0)
+
+
 def auto_planner_grid(points, obstacle_centers, obstacle_sizes, cell=0.8, margin=2.0, height=2.0):
     """Voxel grid (center, size, resolution) covering points and obstacles.
 

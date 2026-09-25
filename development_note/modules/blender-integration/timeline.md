@@ -75,3 +75,56 @@ See `Blender/README.md` ("Data conventions", "Why calibration is necessary",
 - Scene unit scale converts Blender units to meters (`scale_length`).
 - Armature object is static during the baked range.
 - Default style = first guidance alphabetically ("BigSteps"), same as the demo.
+
+---
+
+## [2026-09-25] Joystick control input, Blender 5.2 LTS, defaults
+
+**Type**: `feature` + `investigation`
+**Status**: `resolved` (UI modal path and Windows runner still need a manual check)
+
+### Context
+User feedback: RTX 3050, Blender 4.5 LTS moving to 5.2 LTS. Mimic the original
+research's joystick input (a vector) with Blender objects, e.g. a Bezier path.
+Pick the less problematic bone-location mode. Default style Neutral.
+
+### Work Done
+1. Read both control schemes: Biped `Control()` (left stick velocity + right stick
+   facing, `SimulationObject.Control`) and Authoring `ControlFromTarget`. Same `Network.pt`.
+2. Ported Biped `Control()` into the runner, bound onto the Authoring MotionController.
+3. Measured both controllers on S-curve / 90 degree corner / hairpin paths
+   (tracking, foot sliding, smoothness, heading jitter, arrival), with
+   moving-phase and stop-phase metrics kept separate.
+4. Investigated failures and treated each as a hypothesis to falsify:
+   - The pure-pursuit stick stopped short. Hypothesis "idle threshold" was falsified
+     (a minimum push made it worse). Root cause: momentum overshoot makes it orbit
+     the end point. Fixed with release/resume hysteresis.
+   - Stuck at 1 m/s on a straight start. Isolated to a cold start below ~1 m/s: the
+     model shuffles just above 0.1 m/s, synchronization pins the simulated
+     trajectory to the actor, and no lag builds up. A 1 s idle warm-up did NOT fix
+     0.4-0.8 m/s. A speed PID (Quadruped demo) fixed 0.8+ only. Position tracking
+     (feed-forward + P on a reference) fixed all speeds.
+   - Tracker overshoot at the path end: fixed with reference braking (1 m/s^2).
+   - Cross-track feedback and gains 3/4 were measured worse than point tracking at
+     gain 2. Removed.
+5. Blender side: virtual sticks (gate circle + constrained knob), facing modes,
+   Auto controller, Neutral default, helpers, UI. Middleware functions
+   `stick_from_knob`, `facing_from_objects`; exchange schema v2.
+6. Blender 5.2.2 LTS (Python 3.13, NumPy 2.5): full suite passes unchanged.
+
+### Checklist
+- [x] Backwards / strafe / look-at work with the network (facing error 1.8-5.7 degrees)
+- [x] Speed Assist: 0.4-2.0 m/s start from standing; 1 m/s x 5 s -> 4.99 m
+- [x] Auto controller: Goal for paths facing the movement (best measured), Joystick otherwise
+- [x] Virtual joystick in real Blender: walks +Y at 1.00 m/s facing -Y, bake check 0.00 mm
+- [x] Suites on bpy 4.5 / 5.0 / 5.2 and the model env
+- [ ] Modal Generate button in an interactive Blender window
+- [ ] Runner with a CUDA (RTX 3050) torch build on the user's machine
+
+### Decisions
+- Bone Locations default stays All Bones (exact): Root Only drifts feet 2-3.5 cm (sliding).
+- Style default Neutral; style selection itself left as is (user: later).
+
+### Assumptions Made
+- Stick up = Blender +Y (same as the gamepad demo's world mapping); rotate the gate to change it.
+- The model's slowest reliable gait is ~0.3-0.4 m/s (0.4 m/s commanded -> 0.33 m/s achieved).

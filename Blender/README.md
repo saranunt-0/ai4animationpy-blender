@@ -7,7 +7,7 @@ generated motion back onto the armature.
 The core of this folder is a **middleware** that converts Blender data into
 exactly what the model was trained on, and converts the model output back
 into Blender bone channels. It is pure NumPy and is tested against the real
-AI4Animation code and against real Blender (4.5 LTS and 5.0).
+AI4Animation code and against real Blender (4.5 LTS, 5.0 and 5.2 LTS).
 
 ```
 Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ request.npz ──▶ runner (model env: torch)
@@ -29,6 +29,8 @@ Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ reque
 1. **Model environment.** Use the environment from the main
    [installation guide](https://facebookresearch.github.io/ai4animationpy/getting-started/installation/).
    Note the path of its Python executable (`which python` inside the env).
+   A CUDA build of torch uses the GPU automatically (e.g. an RTX 3050); CPU works too,
+   at about 20 ms per simulation step.
 2. **Add-on.** Pick one:
    * *From the checkout (recommended):* symlink `Blender/ai4animation_blender` into
      Blender's add-on folder (e.g. `~/.config/blender/4.5/scripts/addons/`). The
@@ -44,19 +46,60 @@ Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ reque
 1. **Import Geno (glb)**. Imports `Demos/_ASSETS_/Geno/Model.glb` and
    **calibrates** it immediately (see below). Using your own import of the
    same rig? Press **Calibrate** *before* posing it.
-2. **Path**, one of three modes. *Create Path Helpers* creates the objects each mode needs.
-   * *Curve*: walk along a curve object (resampled every *Spacing*).
-   * *Planner*: the demo's voxel A* planner from *Start* to *Goal*
-     around the mesh objects in the *Obstacles* collection (axis-aligned bounds).
-   * *Target*: follow an animated object. Its **−Y axis** is its facing.
-3. **Style**. Guidance style and idle style (used when nearly standing still).
-   Add *style keys* to switch style at a frame, or **Capture** the current pose
-   as a custom style.
-4. **Generate**. *Walk Speed* can be keyframed. The report shows a self-check:
-   Blender is re-evaluated after baking and compared to the model output.
+2. **Control** (see [Control design](#control-design-joystick-input)). *Create Helpers*
+   builds the objects each option needs.
+   * **Movement**: *Curve* (e.g. a Bezier path, resampled every *Spacing*),
+     *Planner* (the demo's voxel A* from *Start* to *Goal* around the meshes in
+     *Obstacles*, as axis-aligned boxes), *Target* (follow an animated object), or
+     **Joystick** (keyframe a virtual left stick).
+   * **Facing**: *Movement* (default), *Look At* an object, *Object Axis* (an
+     object's −Y), or *Right Stick* (a second virtual stick).
+3. **Style**. Guidance style (default *Neutral*) and idle style (used when
+   nearly standing still). Add *style keys* to switch style at a frame, or
+   **Capture** the current pose as a custom style.
+4. **Generate**. *Walk Speed* can be keyframed; with a joystick it is the speed at
+   full deflection. The report shows a self-check: Blender is re-evaluated after
+   baking and compared to the model output.
 
 Outputs: an action on the armature, foot contacts as animated custom properties
 (`ai4a_contact_LeftFoot`, …) and helpers `AI4A_Path`, `AI4A_Goal` and `AI4A_Root`.
+
+## Control design (joystick input)
+
+The research demos drive the same network (`Network.pt` is identical in
+`Demos/Authoring` and `Demos/Locomotion/Biped`) in two ways:
+
+| | Goal controller (`Demos/Authoring`) | Joystick controller (`Demos/Locomotion/Biped`) |
+|---|---|---|
+| Input | a goal transform moving along a path | left stick → velocity (`speed × clamp(stick, 1)`), right stick → facing |
+| Trajectory | `SimulationObject.ControlFromTarget(goal)` | `SimulationObject.Control(position, direction, velocity)` |
+| Facing | always the walking direction | independent: strafe, walk backwards, look at |
+
+In Blender, the joystick is mimicked in two ways:
+
+* **Virtual sticks.** A knob empty (sphere) inside a gate empty (circle, radius 1).
+  The knob's offset is the stick deflection. It is constrained to the circle, so you
+  keyframe it like pushing a thumbstick. *Stick up* is the gate's +Y; rotate the
+  gate to change it. The mapping equals the gamepad demo (stick up = AI4Animation −Z = Blender +Y).
+* **A virtual player.** For paths and targets, each sub-step computes the stick a
+  player would push. A reference point moves along the path at the keyed speed
+  (braking into the end), and `stick velocity = feed-forward + 2/s × offset`.
+
+What decided the defaults (12 s runs at 1.2 m/s: S-curve, 90° corner, 1.2 m-wide hairpin):
+
+* Raw stick velocities (the gamepad demo as-is) **cannot start walking below
+  ~1 m/s** from standing, and cannot hold speeds below ~0.6 m/s. *Speed Assist*
+  (default on) tracks the position the stick implies instead: 0.4–2.0 m/s start
+  reliably and hold within about 0.05 m/s; 1 m/s for 5 s → 4.99 m. Turn it off to
+  get the exact demo behavior.
+* For following a path while facing the walking direction, the **goal controller
+  is better**: max deviation 0.28–0.29 m on every path, versus 0.34–0.41 m for the
+  best joystick tracker (cross-track feedback and higher gains were worse), with
+  smoother root motion. **Controller: Auto** therefore uses Goal for
+  paths/targets with *Facing = Movement*, and Joystick whenever facing is
+  controlled or the movement is a virtual stick.
+* Joystick facing works with this network: walking backwards (facing error
+  2.3°, 1.00 m/s), strafing (1.8°), looking at an object while walking past (5.7°).
 
 ## Data conventions (what the middleware converts)
 
@@ -101,9 +144,9 @@ Network: 441 inputs → 16 × 279 outputs. PostProcessor (contacts): 456 → 16 
 | bone forward axis (Z) | 23×3 | same; needs the per-bone calibration |
 | bone up axis (Y) | 23×3 | same |
 | bone velocities | 23×3 | zero, or finite difference of the Blender pose (frames s−1, s) |
-| future root positions, x/z | 16×2 | path → goal (curve / planner / animated target) → `ControlFromTarget` |
-| future root directions, x/z | 16×2 | path tangent |
-| future root velocities, x/z | 16×2 | walk speed × control strength |
+| future root positions, x/z | 16×2 | goal controller: path/target → `ControlFromTarget`; joystick: sticks → `Control` |
+| future root directions, x/z | 16×2 | walking direction, or the right stick / look-at / object axis |
+| future root velocities, x/z | 16×2 | walk speed (goal: × control strength; joystick: virtual-player command) |
 | guidance positions | 23×3 | style `.npz` (bone order == model order, verified) or a captured Blender pose |
 
 Root definition (`RootModule`, biped, ground): hip x/z at y = 0, facing
@@ -117,7 +160,7 @@ Root definition (`RootModule`, biped, ground): hip x/z at y = 0, facing
 python -m pytest Blender/tests/test_middleware.py
 # parity with ai4animation + runner (model environment)
 /path/to/model/python -m pytest Blender/tests/test_parity_ai4animation.py
-# inside Blender's Python (pip install bpy==4.5.* or 5.0.*), full pipeline
+# inside Blender's Python (pip install bpy==4.5.* | 5.0.* | 5.2.*), full pipeline
 AI4A_PYTHON=/path/to/model/python python -m pytest Blender/tests
 ```
 
@@ -132,11 +175,18 @@ Measured results (float32 limits):
 | captured guidance vs `GuidanceModule` | ≤ 1e-5 m |
 | "Root Only" bone locations | rotations exact, positions within ~1 cm (feet up to 3.5 cm) |
 
+**Bone Locations default: All Bones (exact).** Root Only keeps a clean
+rotation-only rig, but its 2–3.5 cm foot drift shows up as visible foot sliding and
+wrong contacts. The location keys All Bones needs are harmless on Geno (its bones
+are not connected), so exact is the setting with fewer problems.
+
 ## Runner vs. standalone demo
 
 The runner reuses `MotionController` and `PathPlanner3D` unchanged. It differs only where
 Blender needs deterministic, offline baking:
 
+* The joystick controller is the Biped demo's `Control()` bound onto the Authoring
+  `MotionController`, so `Update`, `PredictSequence` and `Animate` are unchanged.
 * Fixed time step, sub-stepped to about 60 Hz (the demo runs at display rate). Blender
   scenes at 24/25/30 fps otherwise get visible prediction blend jumps.
 * The pose starts **at the path start**. In the demo, `Actor.Transforms` stays at the
