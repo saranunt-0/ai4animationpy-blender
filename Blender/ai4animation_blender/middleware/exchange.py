@@ -6,12 +6,13 @@ Both files are .npz archives. Every array is in AI4Animation world space
 this boundary. A JSON "meta" entry carries scalars and names.
 
 Request (Blender -> runner)
-    meta.version, fps, frame_count, bone_names, path_mode, controller,
+    meta.version, fps, frame_count, bone_names, model {type, character,
+    network, postprocessor}, path_mode, controller,
     control_strength, prediction_fps, end_behavior, style_names, idle_style,
     network_iterations, facing_mode, tracking {gain, leash, assist},
     planner {center, size, resolution, max_depth}
     speeds              (F,)        walk speed per frame, m/s (stick: speed at full deflection)
-    style_indices       (F,)        index into style_names per frame
+    style_indices       (F,)        index into style_names per frame (QUADRUPED: Auto/Sit/Stand/Lie)
     path_points         (N, 3)      path_mode == "CURVE"
     start, goal         (3,)        path_mode == "PLANNER"
     obstacle_centers    (M, 3)      path_mode == "PLANNER"
@@ -25,6 +26,13 @@ Request (Blender -> runner)
     initial_velocities  (J, 3)      optional
     initial_root        (4, 4)      optional
     custom_guidances    (K, J, 3)   optional, referenced as "custom:<i>" in style_names
+
+Models (middleware.models)
+    BIPED      Geno, Demos/Authoring network. Both controllers.
+    QUADRUPED  Dog / Wolf, Demos/Locomotion/Quadruped network. STICK only
+               (the demo's gamepad control): speed-chosen gait, facing
+               follows movement, actions Sit/Stand/Lie.
+    network / postprocessor: optional .pt overrides ("" = the demo's files).
 
 Controllers
     GOAL   Demos/Authoring: SimulationObject.ControlFromTarget(goal). Faces
@@ -51,7 +59,9 @@ import json
 
 import numpy as np
 
-VERSION = 2
+from . import models
+
+VERSION = 3
 
 PATH_CURVE = "CURVE"
 PATH_PLANNER = "PLANNER"
@@ -136,10 +146,26 @@ def _load(path, spec):
     return meta, arrays
 
 
+def model_meta(meta):
+    """meta.model with defaults (requests without it drive the biped)."""
+    info = dict(meta.get("model") or {})
+    info.setdefault("type", models.BIPED)
+    info.setdefault("character", "geno" if info["type"] == models.BIPED else "")
+    info.setdefault("network", "")
+    info.setdefault("postprocessor", "")
+    return info
+
+
 def validate_request(meta, arrays):
     errors = []
     frames = int(meta.get("frame_count", 0))
     joints = len(meta.get("bone_names", []))
+    model = model_meta(meta)
+    spec = models.MODELS.get(model["type"])
+    if spec is None:
+        errors.append("model.type must be one of %s" % sorted(models.MODELS))
+    elif model["character"] not in spec.character_keys():
+        errors.append("model.character must be one of %s for %s" % (spec.character_keys(), spec.key))
     if frames < 2:
         errors.append("frame_count must be >= 2")
     if meta.get("fps", 0) <= 0:
@@ -160,6 +186,14 @@ def validate_request(meta, arrays):
     for key, needed in (("facing_points", FACING_LOOK_AT), ("facing_directions", FACING_DIRECTION)):
         if facing == needed and (key not in arrays or arrays[key].shape != (frames, 3)):
             errors.append("facing_mode %s needs %s with shape (%d, 3)" % (needed, key, frames))
+    if spec is not None and not spec.goal_controller and control != CONTROLLER_STICK:
+        errors.append("model %s needs controller STICK" % spec.key)
+    if spec is not None and not spec.facing_control and facing != FACING_MOVE:
+        errors.append("model %s only faces its movement (facing_mode MOVE)" % spec.key)
+    if spec is not None and spec.key == models.QUADRUPED:
+        unknown = [n for n in meta.get("style_names", []) if n not in models.QUADRUPED_STYLES]
+        if unknown:
+            errors.append("QUADRUPED styles must be in %s, got %s" % (models.QUADRUPED_STYLES, unknown))
     tracking = meta.get("tracking", {})
     if float(tracking.get("gain", 1.0)) < 0.0 or float(tracking.get("leash", 1.0)) <= 0.0:
         errors.append("tracking gain must be >= 0 and leash > 0")

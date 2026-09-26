@@ -10,7 +10,8 @@ REPO_DIR = BLENDER_DIR.parent
 sys.path.insert(0, str(BLENDER_DIR))
 sys.path.append(str(REPO_DIR))  # ai4animation without `pip install -e .` (parity tests)
 
-PROFILE_PATH = BLENDER_DIR / "ai4animation_blender" / "profiles" / "geno_profile.json"
+PROFILES_DIR = BLENDER_DIR / "ai4animation_blender" / "profiles"
+PROFILE_PATH = PROFILES_DIR / "geno_profile.json"
 
 
 @pytest.fixture(scope="session")
@@ -18,6 +19,13 @@ def profile():
     from ai4animation_blender.middleware.rig import RigProfile
 
     return RigProfile.from_json(PROFILE_PATH.read_text())
+
+
+@pytest.fixture(scope="session")
+def dog_profile():
+    from ai4animation_blender.middleware.rig import RigProfile
+
+    return RigProfile.from_json((PROFILES_DIR / "dog_profile.json").read_text())
 
 
 @pytest.fixture(scope="session")

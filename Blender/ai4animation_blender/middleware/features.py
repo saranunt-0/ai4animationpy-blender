@@ -5,7 +5,7 @@ Everything here operates in AI4Animation world space (Y-up, +Z forward,
 meters) and mirrors the formulas used during training, so that data
 authored in Blender means the same thing to the network:
 
-* compute_root        == RootModule.Compute (BIPED topology, GROUND reference)
+* compute_root        == RootModule.Compute (BIPED or QUADRUPED topology, GROUND reference)
 * guidance_from_pose  == GuidanceModule.GetLegacyGuidance for a single frame
 * velocities          == finite differences, as MotionModule/Actor use
 """
@@ -13,6 +13,7 @@ authored in Blender means the same thing to the network:
 import numpy as np
 
 from . import conventions as cv
+from .rig import fit_rigid
 
 
 def look_planar(forward):
@@ -33,11 +34,12 @@ def look_planar(forward):
 
 
 def compute_root(transforms, profile):
-    """Character root from a pose, identical to RootModule.Compute(BIPED, GROUND).
+    """Character root from a pose, identical to RootModule.Compute(topology, GROUND).
 
     transforms: (..., J, 4, 4) AI4Animation world transforms in profile bone order.
     Returns (..., 4, 4): position = hip projected to the ground (y = 0),
-    Z axis = horizontal facing derived from hip and shoulder lines.
+    Z axis = horizontal facing: from the hip and shoulder lines (BIPED) or
+    from the hip towards the neck (QUADRUPED).
     """
     names = profile.bone_names
     rb = profile.root_bones
@@ -54,11 +56,14 @@ def compute_root(transforms, profile):
         v = v - np.sum(v * up, axis=-1, keepdims=True) * up
         return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), cv.EPS)
 
-    across = horizontal_unit(pos("left_hip") - pos("right_hip")) + horizontal_unit(
-        pos("left_shoulder") - pos("right_shoulder")
-    )
-    across = across / np.maximum(np.linalg.norm(across, axis=-1, keepdims=True), cv.EPS)
-    forward = horizontal_unit(np.cross(across, up))
+    if getattr(profile, "root_topology", "BIPED") == "QUADRUPED":
+        forward = horizontal_unit(pos("neck") - hip)
+    else:
+        across = horizontal_unit(pos("left_hip") - pos("right_hip")) + horizontal_unit(
+            pos("left_shoulder") - pos("right_shoulder")
+        )
+        across = across / np.maximum(np.linalg.norm(across, axis=-1, keepdims=True), cv.EPS)
+        forward = horizontal_unit(np.cross(across, up))
 
     root = np.zeros(hip.shape[:-1] + (4, 4))
     root[..., 3, 3] = 1.0
@@ -81,6 +86,33 @@ def reroot(transforms, from_root, to_root):
     """Rigidly move a pose so that from_root lands on to_root."""
     delta = cv.as_matrix(to_root) @ np.linalg.inv(cv.as_matrix(from_root))
     return np.einsum("ij,...jk->...ik", delta, cv.as_matrix(transforms))
+
+
+def complete_pose(transforms, profile):
+    """Fill model bones missing in the armature (NaN rows, end sites) from the reference.
+
+    A missing bone keeps its reference offset to its model parent. Without a
+    parent it follows the rigid motion that best maps the reference onto the
+    present bones.
+    """
+    out = np.array(cv.as_matrix(transforms), dtype=float)
+    missing = [i for i in range(out.shape[0]) if not np.all(np.isfinite(out[i]))]
+    if not missing:
+        return out
+    present = [i for i in range(out.shape[0]) if i not in missing]
+    ref = cv.as_matrix(profile.reference_transforms)
+    r, t, _ = fit_rigid(ref[present, :3, 3], out[present, :3, 3])
+    rigid = np.eye(4)
+    rigid[:3, :3] = r
+    rigid[:3, 3] = t
+    parents = profile.parent_indices()
+    for i in missing:  # model order: parents come first
+        p = parents[i]
+        if p >= 0 and np.all(np.isfinite(out[p])):
+            out[i] = out[p] @ np.linalg.inv(ref[p]) @ ref[i]
+        else:
+            out[i] = rigid @ ref[i]
+    return out
 
 
 def velocities(previous_transforms, current_transforms, dt):
