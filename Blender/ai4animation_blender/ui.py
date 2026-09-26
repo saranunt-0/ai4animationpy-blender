@@ -5,6 +5,8 @@ import bpy
 
 from . import blender_io as bio
 from . import pipeline, preferences
+from .middleware import models
+from .properties import is_quadruped, model_spec, selected_character
 
 
 class AI4A_UL_style_keys(bpy.types.UIList):
@@ -37,23 +39,51 @@ class AI4A_PT_main(_Panel, bpy.types.Panel):
             box.label(text="Set both in Preferences > Add-ons > AI4Animation")
         box.operator("ai4a.refresh_profile", icon="FILE_REFRESH")
 
+        layout.row().prop(s, "model", expand=True)
+        character = selected_character(s)
         col = layout.column(align=True)
+        col.prop(s, "character")
         col.prop(s, "armature")
         row = col.row(align=True)
-        row.operator("ai4a.import_rig", text="Import Geno (glb)", icon="IMPORT").file_format = "GLB"
-        row.operator("ai4a.import_rig", text="(fbx)").file_format = "FBX"
-        row = col.row(align=True)
-        row.operator("ai4a.calibrate", icon="ARMATURE_DATA")
+        row.operator("ai4a.import_rig", text="Import %s (glb)" % character.label, icon="IMPORT").file_format = "GLB"
+        if character.fbx_file:
+            row.operator("ai4a.import_rig", text="(fbx)").file_format = "FBX"
+        col.operator("ai4a.calibrate", icon="ARMATURE_DATA")
+        draw_pairing(col, s.armature, character)
+
+
+def draw_pairing(layout, armature, character):
+    """Which character the armature is calibrated (paired) with."""
+    if armature is None:
+        return
+    try:
+        calibration = bio.load_calibration(armature)
+    except ValueError:
         calibration = None
-        if s.armature is not None:
-            try:
-                calibration = bio.load_calibration(s.armature)
-            except ValueError:
-                calibration = None
-        if calibration is not None:
-            col.label(text="Calibrated (%.2f mm)" % (1000 * calibration.max_residual), icon="CHECKMARK")
-        elif s.armature is not None:
-            col.label(text="Not calibrated", icon="ERROR")
+    if calibration is None:
+        layout.label(text="Not paired: Calibrate", icon="ERROR")
+        return
+    paired = models.character_label(calibration.character)
+    if calibration.character != character.key:
+        layout.label(text="Paired with %s, not %s" % (paired, character.label), icon="ERROR")
+        return
+    layout.label(text="Paired with %s (%.2f mm)" % (paired, 1000 * calibration.max_residual), icon="CHECKMARK")
+    if calibration.missing_bones:
+        layout.label(text="Filled from reference: %s" % ", ".join(calibration.missing_bones), icon="INFO")
+
+
+class AI4A_PT_networks(_Panel, bpy.types.Panel):
+    bl_label = "Networks"
+    bl_parent_id = "AI4A_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.ai4a
+        spec = model_spec(s)
+        col = layout.column()
+        col.prop(s, "network_path")
+        col.prop(s, "postprocessor_path")
+        col.label(text="Empty = %s demo networks" % spec.demo_dir.split("/")[-1], icon="INFO")
 
 
 class AI4A_PT_path(_Panel, bpy.types.Panel):
@@ -88,20 +118,29 @@ class AI4A_PT_path(_Panel, bpy.types.Panel):
         if s.path_mode in ("CURVE", "PLANNER"):
             col.prop(s, "end_behavior")
 
+        spec = model_spec(s)
         layout.label(text="Facing")
-        layout.prop(s, "facing_mode", text="")
-        if s.facing_mode == "STICK":
-            layout.prop(s, "right_stick")
-        elif s.facing_mode in ("LOOK_AT", "OBJECT"):
-            layout.prop(s, "facing_object")
-            if s.facing_mode == "OBJECT":
-                layout.label(text="The object's -Y axis is the facing", icon="INFO")
+        if not spec.facing_control:
+            layout.label(text="%s faces where it walks" % selected_character(s).label, icon="INFO")
+        else:
+            layout.prop(s, "facing_mode", text="")
+            if s.facing_mode == "STICK":
+                layout.prop(s, "right_stick")
+            elif s.facing_mode in ("LOOK_AT", "OBJECT"):
+                layout.prop(s, "facing_object")
+                if s.facing_mode == "OBJECT":
+                    layout.label(text="The object's -Y axis is the facing", icon="INFO")
 
         box = layout.box()
-        box.prop(s, "controller")
+        if spec.goal_controller:
+            box.prop(s, "controller")
         try:
             resolved = pipeline.resolve_controller(s)
-            box.label(text="Using: %s" % ("Joystick (Biped demo)" if resolved == "STICK" else "Goal (Authoring demo)"))
+            if resolved == "STICK":
+                demo = "Quadruped demo" if is_quadruped(s) else "Biped demo"
+                box.label(text="Using: Joystick (%s)" % demo)
+            else:
+                box.label(text="Using: Goal (Authoring demo)")
         except pipeline.PipelineError as error:
             resolved = None
             box.label(text=str(error)[:60], icon="ERROR")
@@ -121,15 +160,22 @@ class AI4A_PT_style(_Panel, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.ai4a
+        quadruped = is_quadruped(s)
         col = layout.column()
-        col.prop(s, "style")
-        col.prop(s, "idle_style")
-        layout.label(text="Style changes over time:")
+        if quadruped:
+            col.prop(s, "style", text="Action")
+        else:
+            col.prop(s, "style")
+            col.prop(s, "idle_style")
+        layout.label(text="Actions over time:" if quadruped else "Style changes over time:")
         row = layout.row()
         row.template_list("AI4A_UL_style_keys", "", s, "style_keys", s, "style_key_index", rows=2)
         sub = row.column(align=True)
         sub.operator("ai4a.style_key_add", icon="ADD", text="")
         sub.operator("ai4a.style_key_remove", icon="REMOVE", text="")
+        if quadruped:
+            layout.label(text="Sit / Stand / Lie: stops first. Auto: gait by speed", icon="INFO")
+            return
 
         box = layout.box()
         box.label(text="Custom style from the current pose")
@@ -172,7 +218,7 @@ class AI4A_PT_generate(_Panel, bpy.types.Panel):
             layout.label(text=s.status)
 
 
-CLASSES = (AI4A_UL_style_keys, AI4A_PT_main, AI4A_PT_path, AI4A_PT_style, AI4A_PT_generate)
+CLASSES = (AI4A_UL_style_keys, AI4A_PT_main, AI4A_PT_networks, AI4A_PT_path, AI4A_PT_style, AI4A_PT_generate)
 
 
 def register():

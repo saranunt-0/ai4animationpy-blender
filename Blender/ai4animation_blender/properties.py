@@ -1,31 +1,71 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import functools
 import json
 from pathlib import Path
 
 import bpy
 
-from .middleware import exchange, rig
+from .middleware import exchange, models, rig
 
-SHIPPED_PROFILE = Path(__file__).resolve().parent / "profiles" / "geno_profile.json"
+PROFILES_DIR = Path(__file__).resolve().parent / "profiles"
+SHIPPED_PROFILE = PROFILES_DIR / "geno_profile.json"
 
 _enum_cache = []  # Blender requires dynamic enum item strings to stay referenced
 _main_cache = []
 _idle_cache = []
+_character_cache = []
 DEFAULT_STYLE = "Neutral"
+QUADRUPED_STYLE_HELP = {
+    models.QUADRUPED_AUTO: "Walk, pace, trot or canter, chosen by speed (as in the demo)",
+    "Sit": "Stop, then sit (demo: R1)",
+    "Stand": "Stop, then stand on the hind legs (demo: L1)",
+    "Lie": "Stop, then lie down (demo: L2)",
+}
+
+
+def model_spec(settings):
+    return models.get(settings.model)
+
+
+def selected_character(settings):
+    """The selected character, or the model's first one (e.g. right after switching model)."""
+    spec = model_spec(settings)
+    key = settings.character
+    return spec.character(key) if key in spec.character_keys() else spec.characters[0]
+
+
+@functools.lru_cache(maxsize=None)
+def shipped_profile(file_name):
+    return rig.RigProfile.from_json((PROFILES_DIR / file_name).read_text())
 
 
 def get_profile(scene):
-    text = scene.ai4a.profile_json or SHIPPED_PROFILE.read_text()
-    return rig.RigProfile.from_json(text)
+    """Rig profile of the selected character: the one read by 'Test Model
+    Environment' when it matches, else the profile shipped with the add-on."""
+    settings = scene.ai4a
+    character = selected_character(settings)
+    if settings.profile_json:
+        profile = rig.RigProfile.from_json(settings.profile_json)
+        if profile.character == character.key:
+            return profile
+    return shipped_profile(character.profile_file)
+
+
+def is_quadruped(settings):
+    return settings.model == models.QUADRUPED
 
 
 def style_items(self, context):
     items = []
     scene = context.scene if context else None
+    if scene is not None and is_quadruped(scene.ai4a):
+        items = [(name, name, QUADRUPED_STYLE_HELP[name]) for name in models.QUADRUPED_STYLES]
+        _enum_cache[:] = items
+        return _enum_cache
     try:
         names = get_profile(scene).guidance_names if scene else []
     except Exception:  # corrupted profile text: fall back to shipped one
-        names = rig.RigProfile.from_json(SHIPPED_PROFILE.read_text()).guidance_names
+        names = shipped_profile(SHIPPED_PROFILE.name).guidance_names
     for name in names:
         items.append((name, name, "Guidance style from Demos/Authoring/Guidances/%s.npz" % name))
     if scene is not None:
@@ -37,6 +77,26 @@ def style_items(self, context):
         items.append(("Neutral", "Neutral", ""))
     _enum_cache[:] = items
     return _enum_cache
+
+
+def character_items(self, context):
+    spec = models.get(self.model)
+    _character_cache[:] = [
+        (c.key, c.label, "Pair an armature with %s: import it or calibrate a copy of its rig" % c.label)
+        for c in spec.characters
+    ]
+    return _character_cache
+
+
+def _model_changed(self, context):
+    """Styles, networks and iterations belong to one model: reset them to its defaults."""
+    spec = models.get(self.model)
+    self.character = spec.characters[0].key
+    self.network_iterations = spec.network_iterations
+    self.network_path = ""
+    self.postprocessor_path = ""
+    self.style_keys.clear()
+    self.style = models.QUADRUPED_AUTO if spec.key == models.QUADRUPED else DEFAULT_STYLE
 
 
 def _first(items, name):
@@ -77,6 +137,29 @@ class AI4A_StyleKey(bpy.types.PropertyGroup):
 
 class AI4A_Settings(bpy.types.PropertyGroup):
     profile_json: bpy.props.StringProperty(options={"HIDDEN"})
+
+    model: bpy.props.EnumProperty(
+        name="Model",
+        items=tuple(
+            (spec.key, spec.label, "%s (%s)" % (spec.demo_dir, ", ".join(c.label for c in spec.characters)))
+            for spec in models.MODELS.values()
+        ),
+        default=models.BIPED,
+        update=_model_changed,
+        description="Network to animate with. Switching resets styles, network files and iterations",
+    )
+    character: bpy.props.EnumProperty(
+        name="Character", items=character_items,
+        description="Character the armature is paired with (its bones and reference pose)",
+    )
+    network_path: bpy.props.StringProperty(
+        name="Network", subtype="FILE_PATH",
+        description="Motion network (.pt) trained for this model. Empty = the demo's network",
+    )
+    postprocessor_path: bpy.props.StringProperty(
+        name="PostProcessor", subtype="FILE_PATH",
+        description="Contact network (.pt) trained with the motion network. Empty = the demo's",
+    )
 
     armature: bpy.props.PointerProperty(name="Armature", type=bpy.types.Object, poll=_poll_armature)
 
@@ -151,8 +234,11 @@ class AI4A_Settings(bpy.types.PropertyGroup):
     target_object: bpy.props.PointerProperty(name="Target", type=bpy.types.Object)
 
     walk_speed: bpy.props.FloatProperty(
-        name="Walk Speed", default=1.0, min=0.0, soft_max=3.0, unit="VELOCITY",
-        description="Meters per second along the path, or at full stick deflection (can be keyframed)",
+        name="Walk Speed", default=1.0, min=0.0, soft_max=4.5, unit="VELOCITY",
+        description=(
+            "Meters per second along the path, or at full stick deflection (can be keyframed). "
+            "Biped up to ~3 m/s; quadruped walks below 1.2, trots from 2, canters from 4"
+        ),
     )
     control_strength: bpy.props.FloatProperty(name="Control Strength", default=2.0, min=0.0, soft_max=5.0)
     end_behavior: bpy.props.EnumProperty(

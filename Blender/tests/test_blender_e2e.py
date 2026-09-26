@@ -164,3 +164,72 @@ def test_curve_with_look_at_uses_joystick_controller(scene):
 def test_default_style_is_neutral(scene):
     assert scene.ai4a.style == "Neutral"
     assert scene.ai4a.idle_style == "Idle"
+
+
+# ----------------------------------------------------------------------------
+# Quadruped (Dog / Wolf)
+# ----------------------------------------------------------------------------
+
+
+def _import_quadruped(scene, character):
+    from ai4animation_blender import blender_io as bio
+
+    scene.ai4a.model = "QUADRUPED"
+    scene.ai4a.character = character
+    arm = _import("GLB")
+    calibration = bio.load_calibration(arm)
+    assert calibration.character == character
+    assert calibration.max_residual < 1e-4
+    return arm, calibration
+
+
+@pytest.mark.parametrize("character", ["dog", "wolf"])
+def test_quadruped_curve(scene, character):
+    arm, calibration = _import_quadruped(scene, character)
+    assert calibration.missing_bones == (["HeadSite"] if character == "dog" else [])
+    s = scene.ai4a
+    s.path_mode = "CURVE"
+    assert bpy.ops.ai4a.setup_helpers() == {"FINISHED"}
+    s.walk_speed = 2.0  # trot
+    _check_against_model(scene, bpy.ops.ai4a.generate())
+    err_mm = float(s.status.split("Check vs model: ")[1].split(" mm")[0])
+    assert err_mm < 0.1, s.status
+    start, end = _hips_world(arm, 1), _hips_world(arm, 73)
+    assert np.linalg.norm(start[:2]) < 0.1  # curve starts at the origin
+    assert np.linalg.norm(end[:2] - start[:2]) > 2.5  # trotted in 3 s
+    assert "ai4a_contact_LeftFootSite" in arm.keys()
+
+
+def test_quadruped_sits_on_a_keyed_action(scene):
+    arm, _ = _import_quadruped(scene, "dog")
+    s = scene.ai4a
+    s.path_mode = "STICK"
+    assert bpy.ops.ai4a.setup_helpers() == {"FINISHED"}  # knob centered: stand still
+    s.style = "Auto"
+    scene.frame_set(13)
+    assert bpy.ops.ai4a.style_key_add() == {"FINISHED"}
+    s.style_keys[0].style = "Sit"
+    _check_against_model(scene, bpy.ops.ai4a.generate())
+    standing, sitting = _hips_world(arm, 12)[2], _hips_world(arm, 73)[2]
+    assert standing - sitting > 0.15, (standing, sitting)
+
+
+def test_character_pairing_is_checked(scene):
+    from ai4animation_blender import pipeline
+
+    _import("GLB")  # Geno
+    scene.ai4a.model = "QUADRUPED"
+    with pytest.raises(pipeline.PipelineError, match="paired with Geno, but the selected character is Dog"):
+        pipeline.require_calibration(scene.ai4a)
+
+
+def test_refresh_profile_for_the_selected_character(scene):
+    from ai4animation_blender.properties import get_profile
+
+    s = scene.ai4a
+    s.model = "QUADRUPED"
+    s.character = "wolf"
+    assert bpy.ops.ai4a.refresh_profile() == {"FINISHED"}
+    assert get_profile(scene).character == "wolf"
+    s.character = "dog"
+    assert get_profile(scene).character == "dog"  # shipped profile, not the Wolf's

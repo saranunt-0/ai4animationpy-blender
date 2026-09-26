@@ -77,9 +77,34 @@ def test_panels_draw(addon, mode, facing):
     scene.ai4a.custom_styles.add().name = "Mine"
     scene.ai4a.style_keys.add()
     Layout.calls = []
-    for panel in (ui.AI4A_PT_main, ui.AI4A_PT_path, ui.AI4A_PT_style, ui.AI4A_PT_generate):
-        panel.draw(types.SimpleNamespace(layout=Layout()), bpy.context)
+    _draw_panels()
     assert "ai4a.generate" in Layout.calls
+
+
+def _draw_panels():
+    from ai4animation_blender import ui
+
+    Layout.calls = []
+    for panel in (ui.AI4A_PT_main, ui.AI4A_PT_networks, ui.AI4A_PT_path, ui.AI4A_PT_style, ui.AI4A_PT_generate):
+        panel.draw(types.SimpleNamespace(layout=Layout()), bpy.context)
+
+
+@pytest.mark.parametrize("mode", ["CURVE", "PLANNER", "TARGET", "STICK"])
+def test_quadruped_panels_draw(addon, mode):
+    scene = bpy.context.scene
+    s = scene.ai4a
+    s.model = "QUADRUPED"
+    s.path_mode = mode
+    s.facing_mode = "LOOK_AT"  # the quadruped ignores facing
+    arm = bpy.data.objects.new("Arm", bpy.data.armatures.new("Arm"))
+    scene.collection.objects.link(arm)
+    s.armature = arm
+    s.style_keys.add()
+    _draw_panels()
+    for hidden in ("facing_mode", "facing_object", "controller", "idle_style", "ai4a.capture_style"):
+        assert hidden not in Layout.calls, hidden
+    for shown in ("model", "character", "network_path", "postprocessor_path", "style", "ai4a.generate"):
+        assert shown in Layout.calls, shown
 
 
 def test_style_enum_lists_shipped_and_custom_styles(addon):
@@ -91,6 +116,47 @@ def test_style_enum_lists_shipped_and_custom_styles(addon):
     assert "Neutral" in names and "Idle" in names and "custom:Mine" in names
     # dynamic enums default to their first item: idle must default to "Idle"
     assert scene.ai4a.idle_style == "Idle"
+
+
+def test_switching_model_resets_model_settings(addon):
+    from ai4animation_blender import pipeline
+    from ai4animation_blender.properties import get_profile, style_items
+
+    scene = bpy.context.scene
+    s = scene.ai4a
+    s.style = "Zombie"
+    s.style_keys.add()
+    s.network_path = "/somewhere/Network.pt"
+    s.network_iterations = 5
+    s.model = "QUADRUPED"
+    assert s.character == "dog"
+    assert (s.network_iterations, s.network_path, len(s.style_keys), s.style) == (1, "", 0, "Auto")
+    assert [i[0] for i in style_items(s, bpy.context)] == ["Auto", "Sit", "Stand", "Lie"]
+    assert get_profile(scene).character == "dog"
+    s.character = "wolf"
+    assert get_profile(scene).name == "Wolf"
+    s.facing_mode, s.controller = "LOOK_AT", "GOAL"
+    assert pipeline.resolve_controller(s) == "STICK"
+    assert pipeline.facing_mode(s) == "MOVE"
+    s.model = "BIPED"
+    assert (s.character, s.network_iterations, s.style) == ("geno", 3, "Neutral")
+    assert get_profile(scene).character == "geno"
+
+
+def test_network_overrides_are_checked_and_sent(addon, tmp_path):
+    from ai4animation_blender import pipeline
+
+    s = bpy.context.scene.ai4a
+    s.model = "QUADRUPED"
+    s.character = "wolf"
+    assert pipeline.model_info(s) == {"type": "QUADRUPED", "character": "wolf", "network": "", "postprocessor": ""}
+    s.network_path = str(tmp_path / "missing.pt")
+    with pytest.raises(pipeline.PipelineError, match="Network file not found"):
+        pipeline.model_info(s)
+    net = tmp_path / "MyNetwork.pt"
+    net.write_bytes(b"")
+    s.network_path = str(net)
+    assert pipeline.model_info(s)["network"] == str(net)
 
 
 class _PrefsProxy:

@@ -518,6 +518,7 @@ def test_shipped_profiles_match_the_model_registry(model):
             prof.bone_count, len(prof.contact_bones), prof.sequence["length"]
         )
         assert models.character_model(character.key) is spec
+        assert models.character_label(character.key) == character.label
 
 
 def test_requests_default_to_the_biped(tmp_path, profile):

@@ -17,8 +17,8 @@ import numpy as np
 from . import blender_io as bio
 from . import preferences
 from .middleware import conventions as cv
-from .middleware import exchange, features, rig
-from .properties import get_profile
+from .middleware import exchange, features, models, rig
+from .properties import get_profile, is_quadruped, model_spec, selected_character
 
 RUNNER = Path(__file__).resolve().parent / "runner" / "ai4a_runner.py"
 
@@ -132,11 +132,30 @@ def tail(text, lines=15):
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
+def model_info(settings):
+    """meta.model: which network animates which character (overrides as absolute paths)."""
+    info = {
+        "type": settings.model,
+        "character": selected_character(settings).key,
+        "network": bpy_path(settings.network_path),
+        "postprocessor": bpy_path(settings.postprocessor_path),
+    }
+    for key in ("network", "postprocessor"):
+        if info[key] and not Path(info[key]).is_file():
+            raise PipelineError("%s file not found: %s" % (key.capitalize(), info[key]))
+    return info
+
+
 def refresh_profile(context, timeout=600):
+    info = model_info(context.scene.ai4a)
     work = tempfile.mkdtemp(prefix="ai4a_")
     try:
         out = Path(work) / "profile.json"
-        run_blocking(runner_command(context, "profile", "--out", str(out)), timeout)
+        args = ["profile", "--out", str(out), "--model", info["type"], "--character", info["character"]]
+        for key in ("network", "postprocessor"):
+            if info[key]:
+                args += ["--" + key, info[key]]
+        run_blocking(runner_command(context, *args), timeout)
         context.scene.ai4a.profile_json = out.read_text()
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -159,23 +178,36 @@ def frame_numbers(settings, scene):
 
 
 def require_calibration(settings):
+    """The armature and its calibration, which must pair it with the selected character."""
+    character = selected_character(settings)
     arm = settings.armature
     if arm is None:
-        raise PipelineError("Pick the armature (or use 'Import Geno Rig').")
+        raise PipelineError("Pick the armature (or use 'Import %s')." % character.label)
     calibration = bio.load_calibration(arm)
     if calibration is None:
         raise PipelineError("Armature is not calibrated. Use 'Calibrate' right after importing the rig.")
+    if calibration.character != character.key:
+        paired = models.character_label(calibration.character)
+        raise PipelineError(
+            "'%s' is paired with %s, but the selected character is %s. Select %s, or import / "
+            "calibrate a %s rig." % (arm.name, paired, character.label, paired, character.label)
+        )
     return arm, calibration
 
 
 def style_timeline(settings, frames):
-    """Style names used + per-frame index, from the base style and style keys."""
+    """Style names used + per-frame index, from the base style and style keys.
+
+    Quadruped "styles" are the demo's actions (Auto = gait by speed).
+    """
     keys = sorted(((k.frame, k.style) for k in settings.style_keys), key=lambda x: x[0])
     names = [settings.style]
     for _, style in keys:
         if style not in names:
             names.append(style)
-    idle = settings.idle_style or "Idle"
+    if "" in names:  # an enum index left over from another model
+        raise PipelineError("A style key has no valid style for this model. Pick one or remove the key.")
+    idle = models.QUADRUPED_AUTO if is_quadruped(settings) else (settings.idle_style or "Idle")
     if idle.startswith(exchange.CUSTOM_PREFIX) and idle not in names:
         names.append(idle)
     indices = np.zeros(len(frames), dtype=np.int64)
@@ -213,6 +245,8 @@ def resolve_controller(settings):
     smoother. Facing control (look-at, object, right stick) and keyed stick
     input need the gamepad controller (Demos/Locomotion/Biped).
     """
+    if not model_spec(settings).goal_controller:  # the quadruped demo only has stick control
+        return exchange.CONTROLLER_STICK
     needs_stick = settings.path_mode == exchange.PATH_STICK or settings.facing_mode != "MOVE"
     if settings.controller == "AUTO":
         return exchange.CONTROLLER_STICK if needs_stick else exchange.CONTROLLER_GOAL
@@ -222,6 +256,11 @@ def resolve_controller(settings):
             "Use Controller 'Auto' or 'Joystick'."
         )
     return settings.controller
+
+
+def facing_mode(settings):
+    """Blender facing option in effect (a model without facing control faces its movement)."""
+    return settings.facing_mode if model_spec(settings).facing_control else "MOVE"
 
 
 def knob_and_gate(obj, label):
@@ -243,13 +282,15 @@ def build_request(context):
 
     style_names, idle, style_indices, customs = style_timeline(settings, frames)
     controller = resolve_controller(settings)
+    facing = facing_mode(settings)
     meta = {
+        "model": model_info(settings),
         "fps": fps,
         "frame_count": int(len(frames)),
         "bone_names": profile.bone_names,
         "path_mode": settings.path_mode,
         "controller": controller,
-        "facing_mode": FACING_TO_EXCHANGE[settings.facing_mode],
+        "facing_mode": FACING_TO_EXCHANGE[facing],
         "tracking": {
             "gain": settings.tracking_gain,
             "leash": settings.tracking_leash * mpu,
@@ -306,9 +347,9 @@ def build_request(context):
         sampled["target"] = settings.target_object
     if mode == exchange.PATH_STICK:
         sampled["left_knob"], sampled["left_gate"] = knob_and_gate(settings.left_stick, "left stick")
-    if settings.facing_mode == "STICK":
+    if facing == "STICK":
         sampled["right_knob"], sampled["right_gate"] = knob_and_gate(settings.right_stick, "right stick")
-    elif settings.facing_mode in ("LOOK_AT", "OBJECT"):
+    elif facing in ("LOOK_AT", "OBJECT"):
         if settings.facing_object is None:
             raise PipelineError("Pick the facing object.")
         sampled["facing"] = settings.facing_object
@@ -320,20 +361,20 @@ def build_request(context):
     if mode == exchange.PATH_STICK:
         arrays["move_sticks"] = features.stick_from_knob(mats["left_gate"], mats["left_knob"][:, :3, 3])
         arrays["start_transform"] = start_transform(scene, settings, arm, calibration, profile, frames[0], mpu)
-    if settings.facing_mode == "STICK":
+    if facing == "STICK":
         arrays["facing_directions"] = features.stick_from_knob(mats["right_gate"], mats["right_knob"][:, :3, 3])
-    elif settings.facing_mode == "LOOK_AT":
+    elif facing == "LOOK_AT":
         arrays["facing_points"] = cv.points_blender_to_ai4a(mats["facing"][:, :3, 3], mpu)
-    elif settings.facing_mode == "OBJECT":
+    elif facing == "OBJECT":
         arrays["facing_directions"] = features.facing_from_objects(mats["facing"], mpu)
 
     if settings.start_from_pose:
         current = scene.frame_current
         try:
             scene.frame_set(int(frames[0]) - 1)
-            before = calibration.to_ai4a(bio.snapshot_armature(arm, scene))
+            before = armature_pose(arm, scene, calibration, profile)
             scene.frame_set(int(frames[0]))
-            pose = calibration.to_ai4a(bio.snapshot_armature(arm, scene))
+            pose = armature_pose(arm, scene, calibration, profile)
         finally:
             scene.frame_set(current)
         arrays["initial_transforms"] = pose
@@ -341,6 +382,12 @@ def build_request(context):
         arrays["initial_root"] = features.compute_root(pose, profile)
 
     return meta, arrays, frames
+
+
+def armature_pose(arm, scene, calibration, profile):
+    """Current armature pose as model transforms; bones the armature lacks
+    (end sites) are filled from the reference pose."""
+    return features.complete_pose(calibration.to_ai4a(bio.snapshot_armature(arm, scene)), profile)
 
 
 def start_transform(scene, settings, arm, calibration, profile, frame, mpu):
@@ -351,7 +398,7 @@ def start_transform(scene, settings, arm, calibration, profile, frame, mpu):
     current = scene.frame_current
     try:
         scene.frame_set(int(frame))
-        pose = calibration.to_ai4a(bio.snapshot_armature(arm, scene))
+        pose = armature_pose(arm, scene, calibration, profile)
     finally:
         scene.frame_set(current)
     return features.compute_root(pose, profile)
@@ -384,7 +431,7 @@ def apply_result(context, result_path, frames):
     scene.frame_set(current)
 
     basis, _ = calibration.to_blender_basis(snapshot, res["transforms"], settings.location_mode)
-    mapped = set(calibration.blender_bone_names)
+    mapped = set(calibration.mapped_blender_bones)
     constant = [n for n in snapshot.bone_names if n not in mapped]
     action = bio.bake_basis(arm, basis, frames, snapshot.bone_names, settings.action_name, constant_bones=constant)
     if settings.store_contacts and "contacts" in res:

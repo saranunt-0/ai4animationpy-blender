@@ -122,3 +122,11 @@ def character_model(character_key):
         if character_key in spec.character_keys():
             return spec
     raise KeyError("Unknown character %r" % character_key)
+
+
+def character_label(character_key):
+    """Display name of a character key ("dog" -> "Dog"); unknown keys as they are."""
+    try:
+        return character_model(character_key).character(character_key).label
+    except KeyError:
+        return character_key
