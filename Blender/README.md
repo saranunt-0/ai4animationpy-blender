@@ -1,8 +1,12 @@
 # AI4Animation for Blender
 
-A Blender add-on that drives the **Authoring** model (`Demos/Authoring`: path
-following + style guidance on the Geno rig) from Blender data and bakes the
-generated motion back onto the armature.
+A Blender add-on that drives AI4Animation models from Blender data and bakes
+the generated motion back onto the armature:
+
+| Model | Demo reused | Characters | Control |
+|---|---|---|---|
+| **Biped** | `Demos/Authoring` (path following + style guidance) | Geno | goal or joystick, styles, facing |
+| **Quadruped** | `Demos/Locomotion/Quadruped` | Dog, Wolf | joystick (virtual player), gaits by speed, Sit / Stand / Lie |
 
 The core of this folder is a **middleware** that converts Blender data into
 exactly what the model was trained on, and converts the model output back
@@ -42,13 +46,22 @@ Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ reque
      then *Edit ▸ Preferences ▸ Add-ons ▸ Install from Disk*.
 3. **Preferences ▸ Add-ons ▸ AI4Animation.** Set *AI4AnimationPy Repository*
    and *Model Python*, then press **Test Model Environment**. This boots the real
-   MotionController once and reads bones, reference pose and styles.
+   controller of the selected model once and reads bones, reference pose and styles.
+   The quadruped demo imports `raylib`, which the main install already provides.
 
 ## Use (View3D ▸ Sidebar ▸ AI4A)
 
-1. **Import Geno (glb)**. Imports `Demos/_ASSETS_/Geno/Model.glb` and
-   **calibrates** it immediately (see below). Using your own import of the
-   same rig? Press **Calibrate** *before* posing it.
+1. **Model and character.** Pick *Biped* or *Quadruped*, then the *Character*
+   (Geno; Dog or Wolf). **Import <Character> (glb)** imports the character's
+   model from `Demos/_ASSETS_` and **pairs** the armature with it: calibration
+   records which character the armature is (see below). Using your own import of
+   the same rig? Select the character and press **Calibrate** *before* posing it.
+   The panel shows *Paired with Dog*; Generate refuses an armature paired with
+   another character. Switching model resets styles, network files and network
+   iterations to that model's defaults.
+   * **Networks** (sub-panel): *Network* and *PostProcessor* `.pt` files to use
+     instead of the demo's (empty = the demo's). They must be trained for the
+     selected model: the runner checks their input size and says so otherwise.
 2. **Control** (see [Control design](#control-design-joystick-input)). *Create Helpers*
    builds the objects each option needs.
    * **Movement**: *Curve* (e.g. a Bezier path, resampled every *Spacing*),
@@ -59,13 +72,34 @@ Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ reque
      object's −Y), or *Right Stick* (a second virtual stick).
 3. **Style**. Guidance style (default *Neutral*) and idle style (used when
    nearly standing still). Add *style keys* to switch style at a frame, or
-   **Capture** the current pose as a custom style.
+   **Capture** the current pose as a custom style. Quadruped: **Action** instead
+   (see [Quadruped](#quadruped-dog--wolf)).
 4. **Generate**. *Walk Speed* can be keyframed; with a joystick it is the speed at
    full deflection. The report shows a self-check: Blender is re-evaluated after
    baking and compared to the model output.
 
 Outputs: an action on the armature, foot contacts as animated custom properties
 (`ai4a_contact_LeftFoot`, …) and helpers `AI4A_Path`, `AI4A_Goal` and `AI4A_Root`.
+
+## Quadruped (Dog / Wolf)
+
+The runner boots the quadruped demo's own `Program` (its `Start`, `Predict`,
+`Animate`, leg IK and guidance templates) and replaces only the gamepad read in
+`Control` by the virtual player's command, so a curve, planner path, target or
+keyed virtual stick drives it like the joystick controller drives the biped.
+
+* **Gait follows speed**, as in the demo: walk below 1.2 m/s, pace to 2, trot to 4,
+  canter above. *Walk Speed* can be keyframed.
+* **Action** (and action keys): *Auto* (gait by speed), *Sit*, *Stand* (hind legs),
+  *Lie*. An action first brings the character to a stop (the demo only triggers
+  actions below 0.5 m/s, so there you release the stick first), then plays.
+* **Facing** always follows the movement (the demo has no facing control), and the
+  controller is always the joystick one.
+* **glTF only.** `Dog.fbx` / `Wolf.fbx` lose the `Hips` bone on import. `Dog.glb` has no
+  `HeadSite` (the demo creates it); the add-on fills it from the reference pose and
+  does not key it.
+* The first prediction uses the demo's *Sit* guidance (`Program.py`: `"Sit" if
+  Sequence is None`), so the hips dip for about 0.2 s at the start, as in the demo.
 
 ## Control design (joystick input)
 
@@ -139,7 +173,9 @@ It is stored on the armature (`ai4a_calibration` custom property).
 
 ## Model inputs and where each comes from
 
-Network: 441 inputs → 16 × 279 outputs. PostProcessor (contacts): 456 → 16 × 4.
+Biped network: 441 inputs → 16 × 279 outputs. PostProcessor (contacts): 456 → 16 × 4.
+Quadruped network: 339 = 27 bones × 9 (position, velocity, guidance; no bone axes) + 96
+trajectory; PostProcessor 504 → 16 × 4 (feet and hands). The table lists the biped.
 
 | Input (all in the current root frame) | Size | Source when driven from Blender |
 |---|---|---|
@@ -152,9 +188,10 @@ Network: 441 inputs → 16 × 279 outputs. PostProcessor (contacts): 456 → 16 
 | future root velocities, x/z | 16×2 | walk speed (goal: × control strength; joystick: virtual-player command) |
 | guidance positions | 23×3 | style `.npz` (bone order == model order, verified) or a captured Blender pose |
 
-Root definition (`RootModule`, biped, ground): hip x/z at y = 0, facing
-= horizontal cross product of the hip/shoulder lines with up. Reimplemented in
-`middleware/features.py` and checked against `RootModule` on real mocap.
+Root definition (`RootModule`, ground): hip x/z at y = 0. Facing: biped = horizontal
+cross product of the hip/shoulder lines with up; quadruped = hips → neck,
+horizontal. Reimplemented in `middleware/features.py` and checked against
+`RootModule` on real mocap of both.
 
 ## Verification
 
@@ -174,7 +211,10 @@ Measured results (float32 limits):
 | calibration residual, glTF and FBX import | < 0.001 mm |
 | bake → Blender depsgraph → model, all frames, glTF / FBX | ≤ 1.4e-6 m, ≤ 3e-5° |
 | moved / rotated armature (90° yaw + offset) | same as above; a ×2 scaled parent is rejected |
-| `compute_root` vs `RootModule` (walk3_subject3) | ≤ 1e-5 m |
+| `compute_root` vs `RootModule` (walk3_subject3; quadruped D1_008_KAN01_001) | ≤ 1e-5 m |
+| Dog / Wolf: calibration residual (glTF) | 0.0002 / 0.007 mm |
+| Dog / Wolf: bake → Blender → model | ≤ 0.01 mm, ≤ 0.0003° |
+| Dog / Wolf at 2 m/s along a curve (Blender, 24 fps) | 2.05 m/s |
 | captured guidance vs `GuidanceModule` | ≤ 1e-5 m |
 | "Root Only" bone locations | rotations exact, positions within ~1 cm (feet up to 3.5 cm) |
 
@@ -205,13 +245,12 @@ Blender needs deterministic, offline baking:
 
 ## Limitations
 
-* Rig: Geno only (the model was trained on it). Another rig would need retargeting,
-  not just calibration.
-* Stiff arms come from the model, not the conversion. The original Authoring demo, run
-  unmodified at its defaults, swings the upper arm ~6° (mocap walking: 33–54°). The
-  network predicts about half of the true swing even from a real mocap state, and
-  fed its own output it settles at ~15% of natural swing. The add-on reproduces the
-  demo exactly ("Check vs model: 0.00 mm"). Fingers are never driven: the model's
+* Rigs: Geno, Dog and Wolf (the rigs the networks were trained on). Another rig would
+  need retargeting, not just calibration.
+* Stiff biped arms are the model's behavior, confirmed by the original publisher.
+  The original Authoring demo, run unmodified at its defaults, swings the upper arm
+  ~6° (mocap walking: 33–54°), and the add-on reproduces the demo exactly ("Check vs
+  model: 0.00 mm"). No correction is applied. Fingers are never driven: the model's
   23 bones end at the wrist. Details: `development_note/modules/blender-integration/timeline.md`.
 * Obstacles are axis-aligned boxes (the planner's limitation). Rotated meshes use their bounds.
 * Bone constraints, disabled rotation inheritance and connected bones on the model

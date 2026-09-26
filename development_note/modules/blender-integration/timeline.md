@@ -167,7 +167,7 @@ error reached the user.
 ## [2026-09-26] Stiff arms and hands
 
 **Type**: `investigation`
-**Status**: `handed-off` (root cause found; mitigation needs a decision)
+**Status**: `closed` (the original publisher confirmed it is the model's true behavior; no fix)
 
 ### Context
 User report: legs move naturally, upper body (arms, hands) is very stiff.
@@ -217,7 +217,7 @@ second, it settles at ~15% of natural swing with nearly straight elbows.
 The same happens in the original demo, so it is the model's behavior, not the
 Blender conversion or our setup.
 
-### Mitigation tried (not shipped)
+### Mitigation tried (removed, never committed)
 Feeding the network arm velocities amplified x2 relative to the chest before
 each prediction gives mocap-like arms (43.6 deg, 128 deg/s, elbow range 54
 deg, jitter 1107 deg/s^2 vs mocap 1087-1698) in the demo, where the start turn
@@ -225,17 +225,82 @@ kicks the arms. In the runner (no start turn) the same gain, and even x3-x4 at
 1 m/s, stays stiff: the loop is bistable, the gain sustains a swing but cannot
 start one. At 3 m/s x3-x4 reaches 23-31 deg. Reverted: not reliable enough.
 
-### Options for the user
-1. Arm-swing assist: regulate the fed-back arm velocity toward a speed-dependent
-   target amplitude (like Speed Assist), so the network still generates the pose.
-2. Procedural secondary arm swing phase-locked to the legs, added after the model.
-3. Accept the model's behavior and document it.
+### Decision
+The user checked with the original publisher: stiff arms are the model's true
+result. Option 3 (accept and document) was taken. The arm-velocity experiment
+was removed; the add-on applies no arm correction (README Limitations).
+Options kept on record in case this is revisited: an arm-swing assist that
+regulates the fed-back arm velocity toward a speed-dependent amplitude, or a
+procedural secondary swing phase-locked to the legs.
 Fingers are never driven (the model has 23 bones, hands end at the wrist).
-
-### Unverified Items
-- [ ] Watch the original demo on the user's machine (`python Demos/Authoring/Program.py`,
-      GPU): the arms are expected to look as stiff as in Blender.
 
 ### Assumptions Made
 - The Geno mocap clips are valid natural references even if they are not the
   network's training data (the Biped demo says Style100).
+
+---
+
+## [2026-09-26] Quadruped model (Dog / Wolf), character pairing, network files
+
+**Type**: `feature`
+**Status**: `done` (awaiting user test in Blender)
+
+### Context
+User request: remove the stiff-arm experiment (confirmed model behavior), and
+add UI options to pair the armature with a character and pick the networks
+manually, so the add-on can switch to the quadruped model (the dog demo works
+well).
+
+### Implementation Detail
+- `middleware/models.py`: registry shared by Blender and the runner. Biped =
+  Demos/Authoring + Geno; Quadruped = Demos/Locomotion/Quadruped + Dog, Wolf.
+  Holds default networks, root topology, iterations (3 / 1), input sizes
+  (15 J + 96 / 9 J + 96), max speed, facing and goal-controller support.
+- Pairing: `Calibration.character`; `pipeline.require_calibration` refuses an
+  armature paired with another character. Profiles carry `model`, `character`,
+  `root_topology`; shipped `dog_profile.json`, `wolf_profile.json` come from the
+  runner (`ai4a_runner.py profile --model QUADRUPED --character dog|wolf`).
+- Missing end sites: `*Site` leaf bones may be absent (Dog.glb has no HeadSite).
+  Calibration maps them to None, `to_ai4a` returns NaN rows,
+  `features.complete_pose` fills them (parent offset from the reference, or the
+  rigid fit when parentless). Geno has no `*Site` bones, so it stays strict.
+- Root: `compute_root` follows RootModule QUADRUPED (hips → neck, horizontal).
+- Runner: boots the demo's Program in MANUAL mode with a module-local headless
+  `AI4Animation.Standalone` (no camera/IO), keeps only the chosen character,
+  redirects `torch.load` by lowercase name (demo asks for PostProcessor.pt, file
+  is Postprocessor.pt) and to user overrides, then replaces `Control` with a
+  port that reads `Command` (virtual player) and `Action` (Sit/Stand/Lie). An
+  action also sets the desired speed to 0 so keyed actions trigger while
+  following a path.
+- Network overrides: `meta.model.network` / `postprocessor`; `check_networks`
+  compares input sizes with the controller and names the problem.
+- Exchange v3: `meta.model {type, character, network, postprocessor}`; missing =
+  Biped/Geno (older requests stay valid). Quadruped needs controller STICK,
+  facing MOVE, styles in Auto/Sit/Stand/Lie.
+- Blender: Model (Biped/Quadruped) and Character enums, Networks sub-panel,
+  per-character import (FBX only for Geno), "Paired with X" status, Action
+  instead of Style for the quadruped, facing/controller/custom styles hidden.
+  Switching model resets styles, network files and iterations.
+
+### Measurements
+- Runner, Dog, stick command 0 / 0.7 / 2.0 / 4.0 m/s: Idle / Walk / Trot /
+  Canter, 0.88 / 2.12 / 4.41 m/s in the demo loop; along a path at 2 m/s:
+  2.01 m/s, reached the end, then sat (hips 0.453 → 0.098 m).
+- `compute_root` vs RootModule(QUADRUPED) on D1_008_KAN01_001: ≤ 1e-5 m.
+- Blender 4.5, glTF import + pairing: residual Dog 0.0002 mm (HeadSite
+  missing, filled), Wolf 0.007 mm. Curve at 2 m/s: 2.05 m/s for both; bake check
+  ≤ 0.01 mm, ≤ 0.0003 deg. Keyed Sit lowers the hips.
+- Start-up: the demo's first prediction uses Sit guidance, so the hips dip
+  0.47 → 0.33 m for ~0.2 s. Kept (demo behavior), documented.
+
+### Checklist
+- [x] Middleware tests (quadruped root, missing end site, complete_pose, exchange v3)
+- [x] Parity tests (RootModule quadruped, profiles, path speed Dog/Wolf, Sit, network mismatch)
+- [x] Blender tests (panels, model switch, overrides, pairing, Dog/Wolf e2e) on bpy 4.5 / 5.0 / 5.2
+- [ ] User test in an interactive Blender on Windows
+
+### Assumptions Made
+- "Animating network manually" = choosing the network `.pt` files manually
+  (empty = the demo's). Asked-for scope did not include training.
+- Keyed actions should stop the character first; in the demo the player
+  releases the stick before pressing the action button.

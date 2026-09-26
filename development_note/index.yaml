@@ -3,7 +3,7 @@ last_updated: "2026-09-26"
 modules:
   - name: blender-integration
     path: modules/blender-integration/timeline.md
-    description: "Blender add-on + Blender<->AI4Animation middleware for the Authoring model (Geno rig)"
+    description: "Blender add-on + Blender<->AI4Animation middleware: Authoring biped (Geno) and Locomotion quadruped (Dog, Wolf)"
 standalone:
   - name: architecture
     path: architecture.md

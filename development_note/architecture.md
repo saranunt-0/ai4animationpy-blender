@@ -6,10 +6,10 @@ Blender (bundled Python, NumPy only)            Model environment (Python >= 3.1
 ui.py / operators.py
    │
 pipeline.py ── build_request ──▶ request.npz ──▶ runner/ai4a_runner.py
-   │              ▲                                 AI4Animation(MANUAL) + Demos/Authoring
-blender_io.py     │ middleware (pure NumPy)          MotionController, PathPlanner3D
- (only bpy I/O)   │  conventions / rig /             fixed dt, sub-stepped to ~60 Hz
-   │              │  features / exchange
+   │              ▲                                 AI4Animation(MANUAL) +
+blender_io.py     │ middleware (pure NumPy)          Biped: Demos/Authoring MotionController
+ (only bpy I/O)   │  conventions / rig / models /    Quadruped: Demos/Locomotion/Quadruped Program
+   │              │  features / exchange             PathPlanner3D; fixed dt, ~60 Hz
    └── bake ◀── apply_result ◀── result.npz ◀──────┘
 ```
 
@@ -19,7 +19,7 @@ blender_io.py     │ middleware (pure NumPy)          MotionController, PathPla
 |---|---|---|
 | `middleware/` | NumPy, both coordinate conventions | bpy, torch |
 | `blender_io.py` | bpy, mathutils | model maths |
-| `runner/` | ai4animation, torch, Demos/Authoring | Blender conventions |
+| `runner/` | ai4animation, torch, the demos in `models.py` | Blender conventions |
 | exchange `.npz` | AI4Animation world space only | Blender |
 
 ## Key decisions
@@ -39,3 +39,14 @@ blender_io.py     │ middleware (pure NumPy)          MotionController, PathPla
 5. **Two controllers, chosen automatically.** Goal (Authoring) for path following
    with natural facing, because it measured best. Joystick (Biped `Control()`) with a
    virtual player (reference tracking) for facing control and keyed virtual sticks.
+6. **One registry for models and characters** (`middleware/models.py`), read by
+   both sides: demo folder, default networks, root topology, input sizes,
+   supported controls. Adding a model means a registry entry, a controller
+   factory in the runner and a shipped profile.
+7. **Pairing is part of calibration.** The calibration stores the character it
+   was made for; Generate checks it against the selected character, so a Geno
+   armature can never be driven by the Dog network (bone counts would differ
+   anyway, but the message is clearer).
+8. **Quadruped: the demo's Program, not a rewrite.** Its `Start`, `Predict`,
+   `Animate` and IK run unchanged; only `Control` is replaced by a port that
+   reads the virtual player's command instead of the gamepad.
