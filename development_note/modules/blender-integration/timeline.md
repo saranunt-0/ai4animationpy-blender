@@ -128,3 +128,114 @@ Pick the less problematic bone-location mode. Default style Neutral.
 ### Assumptions Made
 - Stick up = Blender +Y (same as the gamepad demo's world mapping); rotate the gate to change it.
 - The model's slowest reliable gait is ~0.3-0.4 m/s (0.4 m/s commanded -> 0.33 m/s achieved).
+
+---
+
+## [2026-09-26] Windows: "[WinError 193] %1 is not a valid Win32 application"
+
+**Type**: `debug`
+**Status**: `resolved`
+
+### Context
+The user pressed *Test Model Environment* on Windows 64 after setting the
+repository path and `Network.pt`. There is no Network.pt field: the second
+preference is *Model Python*, and the add-on executes that file.
+
+### Root Cause / Outcome
+Setup: *Model Python* pointed at `Network.pt`. Windows cannot execute it and
+reports WinError 193. The add-on shared some blame: it only checked
+`is_file()`, the tooltip and README showed Linux paths only, and the raw OS
+error reached the user.
+
+### Fix / Implementation Detail
+- `pipeline.check_model_python`: the file must exist, be named `python*`, end
+  in `.exe` on Windows and be executable elsewhere. The message names the
+  wrong file and gives the platform's example path.
+- OS errors from starting the runner become `PipelineError("Could not start Model Python ...")`.
+- `run_blocking` also uses `CREATE_NO_WINDOW` (no console flash on Windows).
+- Tooltip and README show Windows and Linux/macOS paths and say the network is
+  found through the repository path.
+
+### Checklist
+- [x] Tests: Network.pt rejected on win32/linux, python.exe accepted on win32,
+      non-executable `python` rejected on linux, start failure is readable
+- [x] Suites on bpy 4.5 / 5.0 / 5.2 (67 passed) and the model env (52 passed)
+- [ ] On the user's Windows machine: the same mistake now shows the new message
+
+---
+
+## [2026-09-26] Stiff arms and hands
+
+**Type**: `investigation`
+**Status**: `handed-off` (root cause found; mitigation needs a decision)
+
+### Context
+User report: legs move naturally, upper body (arms, hands) is very stiff.
+3 m/s, control strength 0.56, All Bones, Neutral. Generate reported
+"Check vs model: 0.00 mm, 0.0000 deg", so Blender shows exactly the model
+output. User hypothesis: something in our setup triggers a problem in the
+original model; compare with the original demo.
+
+### Method
+Arm-swing metrics on the 23 model bones in root space: upper-arm swing (p95
+angle from its mean direction), upper-arm angular speed, elbow range, hand
+forward range, jitter (angular acceleration). References: the Geno mocap
+clips in `Demos/_ASSETS_/Geno/Motions`, binned by speed. The original
+Authoring program (Program.py + MotionController.py, unmodified) was stepped
+headless in MANUAL mode with a stubbed speed slider.
+
+### Ledger (one knob at a time)
+| Run | Upper-arm swing | Angular speed |
+|---|---|---|
+| Mocap ~1 m/s | 33-54 deg | 73-130 deg/s |
+| Mocap ~3 m/s | 52-73 deg | 200-330 deg/s |
+| Original demo, its defaults (1 m/s, strength 2, BigSteps) | 6.3 deg | 19 deg/s |
+| Original demo, user settings (3 m/s, 0.56, Neutral) | 8.9 deg | 46 deg/s |
+| Our runner, user settings | 9.7 deg | 53 deg/s |
+
+Ruled out (arm swing stayed 5-10 deg at 1-3 m/s):
+- Our setup vs the demo (runner == demo, above).
+- Frame rate: dt 1/30, 1/60, 1/144.
+- Control strength 0.56 vs 2.0; style Neutral / BigSteps / Zombie.
+- Prediction FPS 2, 3, 5, 10, 30.
+- Codebook sampling: codes are already peaked (max prob 0.89 of 4 classes);
+  `sample=True` or argmax codes add 1-2 deg only.
+- Network iterations 0, 1, 3, 10.
+- Damping in `Animate`: raw predictions inside the loop already have ~6 deg,
+  the realized actor ~7 deg.
+- Guidance: a static template and the true windowed guidance give the same
+  prediction (teacher forcing).
+- Velocity units: network velocity outputs match finite differences of its own
+  positions (ratio 1.00).
+- `Actor(..., True)` in the Biped demo: the flag is ignored by `Actor.Start`.
+
+### Root Cause
+The network under-predicts arm swing and the closed loop compounds it.
+Teacher forcing (true mocap state, trajectory and guidance as input) gives
+0.3-0.6x of the true 0.5 s upper-arm swing. Fed its own output 10 times a
+second, it settles at ~15% of natural swing with nearly straight elbows.
+The same happens in the original demo, so it is the model's behavior, not the
+Blender conversion or our setup.
+
+### Mitigation tried (not shipped)
+Feeding the network arm velocities amplified x2 relative to the chest before
+each prediction gives mocap-like arms (43.6 deg, 128 deg/s, elbow range 54
+deg, jitter 1107 deg/s^2 vs mocap 1087-1698) in the demo, where the start turn
+kicks the arms. In the runner (no start turn) the same gain, and even x3-x4 at
+1 m/s, stays stiff: the loop is bistable, the gain sustains a swing but cannot
+start one. At 3 m/s x3-x4 reaches 23-31 deg. Reverted: not reliable enough.
+
+### Options for the user
+1. Arm-swing assist: regulate the fed-back arm velocity toward a speed-dependent
+   target amplitude (like Speed Assist), so the network still generates the pose.
+2. Procedural secondary arm swing phase-locked to the legs, added after the model.
+3. Accept the model's behavior and document it.
+Fingers are never driven (the model has 23 bones, hands end at the wrist).
+
+### Unverified Items
+- [ ] Watch the original demo on the user's machine (`python Demos/Authoring/Program.py`,
+      GPU): the arms are expected to look as stiff as in Blender.
+
+### Assumptions Made
+- The Geno mocap clips are valid natural references even if they are not the
+  network's training data (the Biped demo says Style100).

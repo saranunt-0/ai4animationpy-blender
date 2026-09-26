@@ -207,6 +207,12 @@ Blender needs deterministic, offline baking:
 
 * Rig: Geno only (the model was trained on it). Another rig would need retargeting,
   not just calibration.
+* Stiff arms come from the model, not the conversion. The original Authoring demo, run
+  unmodified at its defaults, swings the upper arm ~6° (mocap walking: 33–54°). The
+  network predicts about half of the true swing even from a real mocap state, and
+  fed its own output it settles at ~15% of natural swing. The add-on reproduces the
+  demo exactly ("Check vs model: 0.00 mm"). Fingers are never driven: the model's
+  23 bones end at the wrist. Details: `development_note/modules/blender-integration/timeline.md`.
 * Obstacles are axis-aligned boxes (the planner's limitation). Rotated meshes use their bounds.
 * Bone constraints, disabled rotation inheritance and connected bones on the model
   bones are reported as warnings; the exact bake assumes default inheritance.
