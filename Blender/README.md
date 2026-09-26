@@ -28,7 +28,10 @@ Blender scene ──bpy──▶ blender_io ──▶ middleware ──▶ reque
 
 1. **Model environment.** Use the environment from the main
    [installation guide](https://facebookresearch.github.io/ai4animationpy/getting-started/installation/).
-   Note the path of its Python executable (`which python` inside the env).
+   Note the path of its Python executable: `python -c "import sys; print(sys.executable)"`
+   inside the env. On Windows it is `<venv>\Scripts\python.exe`, on Linux/macOS
+   `<venv>/bin/python`. *Model Python* needs this executable, not `Network.pt`:
+   the network is found through the repository path.
    A CUDA build of torch uses the GPU automatically (e.g. an RTX 3050); CPU works too,
    at about 20 ms per simulation step.
 2. **Add-on.** Pick one:

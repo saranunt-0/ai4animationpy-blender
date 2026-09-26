@@ -41,12 +41,38 @@ def runner_environment():
     return env
 
 
+def check_model_python(path, platform=sys.platform):
+    """Error message if `path` is not a Python executable, else None.
+
+    A common mistake is picking another file of the model environment (e.g.
+    Network.pt), which Windows reports only as "[WinError 193] %1 is not a
+    valid Win32 application".
+    """
+    windows = platform.startswith("win")
+    example = r"<venv>\Scripts\python.exe" if windows else "<venv>/bin/python"
+    hint = (
+        " 'Model Python' must be the Python executable of the environment with torch and "
+        "ai4animation, e.g. %s. The network is found through the repository path." % example
+    )
+    if not path:
+        return "Set 'Model Python' in the add-on preferences." + hint
+    file = Path(path)
+    if not file.is_file():
+        return "Model Python not found: %s." % path + hint
+    if not file.name.lower().startswith("python") or (windows and file.suffix.lower() != ".exe"):
+        return "Model Python is '%s', which is not a Python executable." % file.name + hint
+    if not windows and not os.access(file, os.X_OK):
+        return "Model Python '%s' is not executable." % path + hint
+    return None
+
+
 def runner_command(context, *args):
     prefs = preferences.get(context)
     python = bpy_path(prefs.python_path)
     repo = bpy_path(prefs.repo_path)
-    if not python or not Path(python).is_file():
-        raise PipelineError("Set 'Model Python' in the add-on preferences (the Python with torch + ai4animation).")
+    error = check_model_python(python)
+    if error:
+        raise PipelineError(error)
     if not repo or not (Path(repo) / "ai4animation").is_dir():
         raise PipelineError("Set 'AI4AnimationPy Repository' in the add-on preferences.")
     return [python, str(RUNNER), args[0], "--repo", repo, *args[1:]]
@@ -60,24 +86,43 @@ def bpy_path(path):
     return os.path.normpath(bpy.path.abspath(path))
 
 
-def start_process(command):
-    flags = 0
+def _creation_flags():
+    # No console window flashing up on Windows.
     if sys.platform.startswith("win"):
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=runner_environment(),
-        creationflags=flags,
-    )
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return 0
+
+
+def _start_error(command, error):
+    return PipelineError("Could not start Model Python '%s': %s" % (command[0], error))
+
+
+def start_process(command):
+    try:
+        return subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=runner_environment(),
+            creationflags=_creation_flags(),
+        )
+    except OSError as error:
+        raise _start_error(command, error) from error
 
 
 def run_blocking(command, timeout):
-    proc = subprocess.run(
-        command, capture_output=True, text=True, env=runner_environment(), timeout=timeout
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=runner_environment(),
+            timeout=timeout,
+            creationflags=_creation_flags(),
+        )
+    except OSError as error:
+        raise _start_error(command, error) from error
     if proc.returncode != 0:
         raise PipelineError("Runner failed:\n" + tail(proc.stdout + proc.stderr))
     return proc.stdout

@@ -123,3 +123,40 @@ def test_keyframed_walk_speed_is_sampled_per_frame(addon):
             kp.interpolation = "LINEAR"
     speeds = bio.sample_property(s, "walk_speed", list(range(1, 12)), id_data=scene)
     assert abs(speeds[0]) < 1e-6 and abs(speeds[5] - 1.0) < 1e-6 and abs(speeds[-1] - 2.0) < 1e-6
+
+
+def test_model_python_must_be_a_python_executable(addon, tmp_path):
+    from ai4animation_blender.pipeline import check_model_python
+
+    network = tmp_path / "Network.pt"
+    network.write_bytes(b"\0")
+    exe = tmp_path / "python.exe"
+    exe.write_bytes(b"MZ")
+    posix = tmp_path / "python"
+    posix.write_bytes(b"#!/bin/sh\n")
+    assert "Set 'Model Python'" in check_model_python("")
+    assert "not found" in check_model_python(str(tmp_path / "missing" / "python"))
+    for platform in ("win32", "linux"):
+        message = check_model_python(str(network), platform)
+        assert "not a Python executable" in message and "Network.pt" in message
+    assert r"Scripts\python.exe" in check_model_python(str(network), "win32")
+    assert check_model_python(str(exe), "win32") is None
+    assert "not a Python executable" in check_model_python(str(posix), "win32")
+    assert "not executable" in check_model_python(str(posix), "linux")
+    posix.chmod(0o755)
+    assert check_model_python(str(posix), "linux") is None
+
+
+def test_bad_model_python_is_reported_before_running(addon, tmp_path):
+    from ai4animation_blender import pipeline
+
+    network = tmp_path / "Network.pt"
+    network.write_bytes(b"\0")
+    prefs = bpy.context.preferences.addons[ADDON].preferences
+    prefs.python_path = str(network)
+    prefs.repo_path = str(REPO)
+    with pytest.raises(pipeline.PipelineError, match="not a Python executable"):
+        pipeline.runner_command(bpy.context, "profile")
+    # OS-level start failures (WinError 193 on Windows) become readable errors too
+    with pytest.raises(pipeline.PipelineError, match="Could not start Model Python"):
+        pipeline.run_blocking([str(network)], timeout=10)
