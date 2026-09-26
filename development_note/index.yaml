@@ -1,0 +1,10 @@
+# development_note/index.yaml
+last_updated: "2026-09-25"
+modules:
+  - name: blender-integration
+    path: modules/blender-integration/timeline.md
+    description: "Blender add-on + Blender<->AI4Animation middleware for the Authoring model (Geno rig)"
+standalone:
+  - name: architecture
+    path: architecture.md
+    description: "System overview: Blender add-on, middleware, runner process, exchange format"
