@@ -55,6 +55,9 @@ class RigProfile:
     sequence: Dict[str, float] = field(default_factory=dict)
     name: str = "Geno"
     model_file: str = ""
+    model: str = "BIPED"  # middleware.models key
+    character: str = "geno"  # character key within the model
+    root_topology: str = "BIPED"  # RootModule.Topology used for the character root
 
     @property
     def bone_count(self):
@@ -63,6 +66,12 @@ class RigProfile:
     def parent_indices(self):
         index = {n: i for i, n in enumerate(self.bone_names)}
         return [index.get(p, -1) if p is not None else -1 for p in self.parent_names]
+
+    def end_sites(self):
+        """Leaf bones named *Site (AI4Animation end sites). An armature may lack these:
+        the demos create a missing one themselves (Dog.glb has no HeadSite)."""
+        parents = set(p for p in self.parent_names if p is not None)
+        return [n for n in self.bone_names if n not in parents and n.endswith("Site")]
 
     def to_dict(self):
         return {
@@ -78,6 +87,9 @@ class RigProfile:
             "contact_bones": list(self.contact_bones),
             "guidance_names": list(self.guidance_names),
             "sequence": dict(self.sequence),
+            "model": self.model,
+            "character": self.character,
+            "root_topology": self.root_topology,
         }
 
     def to_json(self):
@@ -100,6 +112,9 @@ class RigProfile:
             sequence=dict(data.get("sequence", {})),
             name=data.get("name", "Geno"),
             model_file=data.get("model_file", ""),
+            model=data.get("model", "BIPED"),
+            character=data.get("character", "geno"),
+            root_topology=data.get("root_topology", "BIPED"),
         )
 
     @classmethod
@@ -178,14 +193,16 @@ def _normalize_name(name):
     return base.replace("_", "").replace(" ", "").lower()
 
 
-def auto_bone_map(model_bone_names, blender_bone_names, overrides=None):
+def auto_bone_map(model_bone_names, blender_bone_names, overrides=None, optional=()):
     """Map every model bone to a Blender bone name.
 
     Order: explicit override, exact, case-insensitive, then name without a
     namespace/prefix ("mixamorig:Hips" -> "hips"). Raises with the full list
-    of problems instead of guessing.
+    of problems instead of guessing. Bones in `optional` (end sites) may be
+    absent from the armature; they are left out of the mapping.
     """
     overrides = dict(overrides or {})
+    optional = set(optional)
     exact = set(blender_bone_names)
     lower = {}
     for b in blender_bone_names:
@@ -214,7 +231,8 @@ def auto_bone_map(model_bone_names, blender_bone_names, overrides=None):
                 ambiguous.append("%s -> %s" % (m, candidates))
                 break
         else:
-            missing.append(m)
+            if m not in optional:
+                missing.append(m)
     if missing or ambiguous:
         raise ValueError(
             "Bone mapping failed. Missing: %s. Ambiguous: %s."
@@ -257,16 +275,31 @@ def fit_rigid(source, target):
 @dataclass
 class Calibration:
     model_bone_names: List[str]
-    blender_bone_names: List[str]  # mapped bones, same order as model_bone_names
-    offsets: np.ndarray  # (J, 3, 3): A_R = C(B)_R @ offsets
+    # Blender bone per model bone (same order); None = end site missing in the armature
+    blender_bone_names: List[Optional[str]]
+    offsets: np.ndarray  # (J, 3, 3): A_R = C(B)_R @ offsets (identity where missing)
     reference_basis: Dict[str, np.ndarray]  # blender bone -> 4x4 basis at calibration
-    position_residuals: np.ndarray  # (J,) meters after rigid alignment
+    position_residuals: np.ndarray  # (J,) meters after rigid alignment (0 where missing)
     placement: Optional[np.ndarray] = None  # 4x4 rigid map scene->reference, info only
     source: str = "pose"
+    character: str = "geno"  # the model character this armature is paired with
 
     @property
     def max_residual(self):
         return float(np.max(self.position_residuals))
+
+    @property
+    def present(self):
+        """Indices (model order) of model bones that exist in the armature."""
+        return [k for k, n in enumerate(self.blender_bone_names) if n is not None]
+
+    @property
+    def mapped_blender_bones(self):
+        return [n for n in self.blender_bone_names if n is not None]
+
+    @property
+    def missing_bones(self):
+        return [m for m, n in zip(self.model_bone_names, self.blender_bone_names) if n is None]
 
     def to_dict(self):
         return {
@@ -280,6 +313,7 @@ class Calibration:
             "position_residuals": np.asarray(self.position_residuals).tolist(),
             "placement": None if self.placement is None else np.asarray(self.placement).reshape(16).tolist(),
             "source": self.source,
+            "character": self.character,
         }
 
     def to_json(self):
@@ -299,6 +333,7 @@ class Calibration:
             position_residuals=np.array(data["position_residuals"], dtype=float),
             placement=None if data.get("placement") is None else np.array(data["placement"], dtype=float).reshape(4, 4),
             source=data.get("source", "pose"),
+            character=data.get("character", "geno"),  # before pairing, Geno was the only rig
         )
 
     @classmethod
@@ -310,34 +345,42 @@ class Calibration:
     # ------------------------------------------------------------------
 
     def mapped_indices(self, snapshot):
-        return [snapshot.index(n) for n in self.blender_bone_names]
+        return [snapshot.index(n) for n in self.mapped_blender_bones]
 
     def blender_world(self, snapshot, armature_space):
-        """Armature-space bone matrices -> rigid Blender world matrices (mapped bones)."""
+        """Armature-space bone matrices -> rigid Blender world matrices (present bones)."""
         pose = cv.as_matrix(armature_space)[..., self.mapped_indices(snapshot), :, :]
         world = np.einsum("ij,...bjk->...bik", snapshot.armature_world, pose)
         return cv.rigid(world)
 
     def to_ai4a(self, snapshot, armature_space=None):
-        """Blender pose (armature space, all bones) -> AI4Animation world transforms (J, 4, 4)."""
+        """Blender pose (armature space, all bones) -> AI4Animation world transforms (J, 4, 4).
+
+        Model bones missing in the armature are NaN; features.complete_pose
+        fills them from the reference pose.
+        """
         if armature_space is None:
             armature_space = snapshot.pose_matrices
+        present = self.present
         g = cv.transforms_blender_to_ai4a(
             self.blender_world(snapshot, armature_space), snapshot.meters_per_unit
         )
-        g[..., :3, :3] = np.einsum("...bij,bjk->...bik", g[..., :3, :3], self.offsets)
-        return g
+        g[..., :3, :3] = np.einsum("...bij,bjk->...bik", g[..., :3, :3], self.offsets[present])
+        out = np.full(g.shape[:-3] + (len(self.model_bone_names), 4, 4), np.nan)
+        out[..., present, :, :] = g
+        return out
 
     # ------------------------------------------------------------------
     # AI4Animation -> Blender
     # ------------------------------------------------------------------
 
     def to_blender_armature_space(self, snapshot, ai4a_transforms):
-        """AI4Animation world (..., J, 4, 4) -> rigid armature-space targets for mapped bones."""
-        a = cv.orthonormalize_transforms(ai4a_transforms)
+        """AI4Animation world (..., J, 4, 4) -> rigid armature-space targets for present bones."""
+        present = self.present
+        a = cv.orthonormalize_transforms(cv.as_matrix(ai4a_transforms)[..., present, :, :])
         g = a.copy()
         g[..., :3, :3] = np.einsum(
-            "...bij,bkj->...bik", a[..., :3, :3], self.offsets
+            "...bij,bkj->...bik", a[..., :3, :3], self.offsets[present]
         )  # A_R @ Off^T
         world = cv.transforms_ai4a_to_blender(g, snapshot.meters_per_unit)
         local = np.einsum("ij,...bjk->...bik", np.linalg.inv(snapshot.armature_world), world)
@@ -359,7 +402,7 @@ class Calibration:
         )
         frames = targets.shape[0]
         count = len(snapshot.bone_names)
-        mapped = {snapshot.index(n): k for k, n in enumerate(self.blender_bone_names)}
+        mapped = {snapshot.index(n): k for k, n in enumerate(self.mapped_blender_bones)}
         rest_rel = snapshot.rest_relative()
         rest_rel_inv = np.linalg.inv(rest_rel)
         identity = np.eye(4)
@@ -407,8 +450,8 @@ def calibrate(snapshot, profile, bone_map=None, source="pose", tolerance=0.02):
                is not in the reference pose or is a different rig.
     """
     if bone_map is None:
-        bone_map = auto_bone_map(profile.bone_names, snapshot.bone_names)
-    blender_names = [bone_map[n] for n in profile.bone_names]
+        bone_map = auto_bone_map(profile.bone_names, snapshot.bone_names, optional=profile.end_sites())
+    blender_names = [bone_map.get(n) for n in profile.bone_names]
     armature_space = snapshot.pose_matrices if source == "pose" else snapshot.rest_matrices
     if armature_space is None:
         raise ValueError("Snapshot has no %s matrices." % source)
@@ -420,10 +463,14 @@ def calibrate(snapshot, profile, bone_map=None, source="pose", tolerance=0.02):
         reference_basis={},
         position_residuals=np.zeros(profile.bone_count),
     )
+    present = probe.present
+    if len(present) < 3:
+        raise ValueError("Only %d model bones found in the armature." % len(present))
     g = cv.transforms_blender_to_ai4a(
         probe.blender_world(snapshot, armature_space), snapshot.meters_per_unit
     )
-    ref = cv.orthonormalize_transforms(profile.reference_transforms)
+    ref = cv.orthonormalize_transforms(profile.reference_transforms)[present]
+    names = [profile.bone_names[k] for k in present]
 
     r, t, scale = fit_rigid(g[:, :3, 3], ref[:, :3, 3])
     aligned_pos = g[:, :3, 3] @ r.T + t
@@ -431,7 +478,7 @@ def calibrate(snapshot, profile, bone_map=None, source="pose", tolerance=0.02):
     if residuals.max() > tolerance:
         worst = np.argsort(-residuals)[:5]
         detail = ", ".join(
-            "%s=%.1fcm" % (profile.bone_names[i], 100 * residuals[i]) for i in worst
+            "%s=%.1fcm" % (names[i], 100 * residuals[i]) for i in worst
         )
         hint = ""
         if abs(scale - 1.0) > 0.05:
@@ -443,8 +490,12 @@ def calibrate(snapshot, profile, bone_map=None, source="pose", tolerance=0.02):
         )
 
     aligned_rot = np.einsum("ij,bjk->bik", r, g[:, :3, :3])
-    offsets = np.einsum("bji,bjk->bik", aligned_rot, ref[:, :3, :3])  # (Q G_R)^T A_R
-    offsets = cv.orthonormalize_zy(offsets)
+    offsets = np.repeat(np.eye(3)[None], profile.bone_count, 0)
+    offsets[present] = cv.orthonormalize_zy(
+        np.einsum("bji,bjk->bik", aligned_rot, ref[:, :3, :3])  # (Q G_R)^T A_R
+    )
+    all_residuals = np.zeros(profile.bone_count)
+    all_residuals[present] = residuals
 
     basis = snapshot.basis_matrices
     reference_basis = {}
@@ -462,7 +513,8 @@ def calibrate(snapshot, profile, bone_map=None, source="pose", tolerance=0.02):
         blender_bone_names=blender_names,
         offsets=offsets,
         reference_basis=reference_basis,
-        position_residuals=residuals,
+        position_residuals=all_residuals,
         placement=placement,
         source=source,
+        character=profile.character,
     )

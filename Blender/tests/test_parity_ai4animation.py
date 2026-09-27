@@ -22,6 +22,7 @@ from ai4animation_blender.middleware.rig import RigProfile  # noqa: E402
 REPO = Path(__file__).resolve().parents[2]
 RUNNER = REPO / "Blender" / "ai4animation_blender" / "runner" / "ai4a_runner.py"
 MOTION = REPO / "Demos" / "_ASSETS_" / "Geno" / "Motions" / "walk3_subject3.npz"
+QUADRUPED_MOTION = REPO / "Demos" / "_ASSETS_" / "Quadruped" / "Motions" / "D1_008_KAN01_001.npz"
 sys.path.insert(0, str(REPO / "Demos" / "_ASSETS_" / "Geno"))
 
 
@@ -61,6 +62,27 @@ def test_root_matches_rootmodule(motion, profile):
     assert cv.rotation_angle_deg(ours[..., :3, :3], expected[..., :3, :3]).max() < 1e-2
 
 
+def test_quadruped_root_matches_rootmodule(dog_profile):
+    from ai4animation import Motion, RootModule
+
+    names = dog_profile.bone_names
+    rb = dog_profile.root_bones
+    m = Motion.LoadFromNPZ(str(QUADRUPED_MOTION))
+    m.AddModules(
+        [
+            lambda x: RootModule(
+                x, rb["hip"], rb["left_hip"], rb["right_hip"], rb["left_shoulder"], rb["right_shoulder"], rb["neck"],
+                topology=RootModule.Topology.QUADRUPED,
+            )
+        ]
+    )
+    timestamps = np.linspace(0.0, m.TotalTime, 40)
+    expected = m.GetModule(RootModule).GetTransforms(timestamps, False)
+    ours = features.compute_root(m.GetBoneTransformations(timestamps, names), dog_profile)
+    assert np.abs(ours[..., :3, 3] - expected[..., :3, 3]).max() < 1e-5
+    assert cv.rotation_angle_deg(ours[..., :3, :3], expected[..., :3, :3]).max() < 1e-2
+
+
 def test_guidance_matches_guidancemodule(motion, profile):
     from ai4animation import GuidanceModule, TimeSeries
 
@@ -95,18 +117,26 @@ def test_shipped_guidances_use_profile_bone_order(profile):
             assert data["Positions"].shape == (profile.bone_count, 3)
 
 
-def test_shipped_profile_matches_runner(tmp_path, profile):
+@pytest.mark.parametrize("model,character", [("BIPED", "geno"), ("QUADRUPED", "dog"), ("QUADRUPED", "wolf")])
+def test_shipped_profile_matches_runner(tmp_path, model, character):
+    from conftest import PROFILES_DIR
+
+    shipped = RigProfile.from_json((PROFILES_DIR / ("%s_profile.json" % character)).read_text())
     out = tmp_path / "profile.json"
     subprocess.run(
-        [sys.executable, str(RUNNER), "profile", "--repo", str(REPO), "--out", str(out)],
+        [sys.executable, str(RUNNER), "profile", "--repo", str(REPO), "--out", str(out),
+         "--model", model, "--character", character],
         check=True,
         capture_output=True,
     )
     fresh = RigProfile.from_json(out.read_text())
-    assert fresh.bone_names == profile.bone_names
-    assert fresh.parent_names == profile.parent_names
-    assert fresh.guidance_names == profile.guidance_names
-    assert np.allclose(fresh.reference_transforms, profile.reference_transforms, atol=1e-6)
+    assert fresh.to_dict() == shipped.to_dict() or (
+        fresh.bone_names == shipped.bone_names
+        and fresh.parent_names == shipped.parent_names
+        and fresh.guidance_names == shipped.guidance_names
+        and np.allclose(fresh.reference_transforms, shipped.reference_transforms, atol=1e-6)
+    )
+    assert (fresh.model, fresh.character) == (model, character)
 
 
 def _request(path, profile, frames, **overrides):
@@ -260,3 +290,91 @@ def test_stick_ghost_starts_at_initial_pose(tmp_path, profile):
     )
     meta, res = _run(tmp_path, req)
     assert np.linalg.norm(res["roots"][-1, :3, 3] - np.array([2.0, 0.0, 0.0])) < 0.2
+
+
+# ----------------------------------------------------------------------------
+# Quadruped (Demos/Locomotion/Quadruped)
+# ----------------------------------------------------------------------------
+
+
+def _quadruped_request(path, profile, frames, character="dog", **overrides):
+    meta = {
+        "model": {"type": "QUADRUPED", "character": character},
+        "controller": exchange.CONTROLLER_STICK,
+        "network_iterations": 1,
+        "style_names": ["Auto", "Sit"],
+    }
+    meta.update(overrides.pop("meta", {}))
+    _request(path, profile, frames, meta=meta, **overrides)
+
+
+@pytest.mark.parametrize("character,speed", [("dog", 2.0), ("wolf", 1.0)])
+def test_quadruped_follows_a_path_at_the_requested_speed(tmp_path, character, speed):
+    from conftest import PROFILES_DIR
+
+    profile = RigProfile.from_json((PROFILES_DIR / ("%s_profile.json" % character)).read_text())
+    frames = 24 * 6
+    req = tmp_path / "req.npz"
+    _quadruped_request(
+        req, profile, frames, character=character,
+        path_points=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0], [0.0, 0.0, 20.0]]),
+        speeds=np.full(frames, speed),
+    )
+    meta, res = _run(tmp_path, req)
+    assert meta["model"]["type"] == "QUADRUPED" and meta["model"]["character"] == character
+    assert res["transforms"].shape == (frames, profile.bone_count, 4, 4)
+    roots = res["roots"]
+    assert np.allclose(roots[0, :3, 3], 0.0, atol=1e-5)
+    z = roots[:, 2, 3]
+    assert abs((z[-1] - z[-49]) / 2.0 - speed) < 0.3  # steady speed over the last 2 s
+    assert np.abs(roots[:, 0, 3]).max() < 0.3  # stays on the path
+    assert np.all((res["contacts"] >= 0) & (res["contacts"] <= 1))
+    hips = res["transforms"][:, 0, :3, 3]
+    assert np.linalg.norm(np.diff(hips, axis=0), axis=-1).max() < 0.25  # no teleport
+
+
+def test_quadruped_sits_when_asked(tmp_path, dog_profile):
+    frames = 24 * 4
+    req = tmp_path / "req.npz"
+    _quadruped_request(
+        req, dog_profile, frames, meta={"path_mode": exchange.PATH_STICK},
+        path_points=None, move_sticks=np.zeros((frames, 3)), start_transform=np.eye(4),
+        speeds=np.zeros(frames), style_indices=np.r_[np.zeros(24, int), np.ones(frames - 24, int)],
+    )
+    meta, res = _run(tmp_path, req)
+    hips_height = res["transforms"][:, 0, 1, 3]
+    # The demo's first prediction uses Sit guidance (Program.py: "Sit" if
+    # Sequence is None), so the hips dip for ~0.2 s before standing.
+    assert hips_height[12:24].min() > 0.4  # standing
+    assert hips_height[-1] < 0.2  # sitting
+    assert np.linalg.norm(res["roots"][-1, :3, 3]) < 0.3  # in place
+
+
+@pytest.mark.parametrize("model,wrong", [
+    ("QUADRUPED", "Demos/Authoring/Models/Network.pt"),
+    ("BIPED", "Demos/Locomotion/Quadruped/Network.pt"),
+])
+def test_network_override_for_another_model_is_rejected(tmp_path, profile, dog_profile, model, wrong):
+    req = tmp_path / "req.npz"
+    if model == "QUADRUPED":
+        _quadruped_request(req, dog_profile, 5, meta={"model": {"type": model, "character": "dog",
+                                                                "network": str(REPO / wrong)}})
+    else:
+        _request(req, profile, 5, meta={"model": {"type": model, "character": "geno", "network": str(REPO / wrong)}})
+    done = subprocess.run(
+        [sys.executable, str(RUNNER), "run", "--repo", str(REPO), "--request", str(req),
+         "--result", str(tmp_path / "result.npz")],
+        capture_output=True, text=True,
+    )
+    assert done.returncode == 1
+    assert "Pick a network trained for this model" in done.stderr
+
+
+def test_network_override_is_used(tmp_path, dog_profile):
+    # The demo's own file given explicitly (as the add-on sends a user's choice).
+    req = tmp_path / "req.npz"
+    network = REPO / "Demos" / "Locomotion" / "Quadruped" / "Network.pt"
+    _quadruped_request(req, dog_profile, 5, meta={"model": {"type": "QUADRUPED", "character": "dog",
+                                                            "network": str(network)}})
+    meta, res = _run(tmp_path, req)
+    assert meta["model"]["network"] == str(network)

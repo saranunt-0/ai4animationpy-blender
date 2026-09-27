@@ -13,7 +13,7 @@ import numpy as np
 from . import blender_io as bio
 from . import pipeline, preferences
 from .middleware import features, rig
-from .properties import get_profile
+from .properties import get_profile, is_quadruped, selected_character
 
 
 def _report_warnings(op, warnings):
@@ -29,10 +29,10 @@ def _calibrate(context, arm, source):
 
 
 class AI4A_OT_import_rig(bpy.types.Operator):
-    """Import the Geno model used by the network and calibrate it"""
+    """Import the selected character's model (the rig the network was trained on) and pair it"""
 
     bl_idname = "ai4a.import_rig"
-    bl_label = "Import Geno Rig"
+    bl_label = "Import Character Rig"
     bl_options = {"REGISTER", "UNDO"}
 
     file_format: bpy.props.EnumProperty(
@@ -41,8 +41,12 @@ class AI4A_OT_import_rig(bpy.types.Operator):
 
     def execute(self, context):
         repo = pipeline.bpy_path(preferences.get(context).repo_path)
-        name = "Model.glb" if self.file_format == "GLB" else "Model.fbx"
-        path = Path(repo) / "Demos" / "_ASSETS_" / "Geno" / name
+        character = selected_character(context.scene.ai4a)
+        relative = character.model_file if self.file_format == "GLB" else character.fbx_file
+        if not relative:  # Dog.fbx / Wolf.fbx lose the Hips bone on import
+            self.report({"ERROR"}, "%s is only available as glTF (.glb)." % character.label)
+            return {"CANCELLED"}
+        path = Path(repo) / relative
         if not path.is_file():
             self.report({"ERROR"}, "Not found: %s (set the repository in the add-on preferences)" % path)
             return {"CANCELLED"}
@@ -63,13 +67,16 @@ class AI4A_OT_import_rig(bpy.types.Operator):
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         context.scene.ai4a.armature = arm
-        self.report({"INFO"}, "Imported and calibrated %s (max mismatch %.3f mm)" % (arm.name, 1000 * calibration.max_residual))
+        self.report(
+            {"INFO"}, "Imported %s and paired it with %s (max mismatch %.3f mm)"
+            % (arm.name, character.label, 1000 * calibration.max_residual)
+        )
         return {"FINISHED"}
 
 
 class AI4A_OT_calibrate(bpy.types.Operator):
-    """Store how this armature's bones map to the model's bones.
-    Run it while the armature shows the model's reference pose (right after import)"""
+    """Pair this armature with the selected character: store how its bones map to the model's bones.
+    Run it while the armature shows the character's reference pose (right after import)"""
 
     bl_idname = "ai4a.calibrate"
     bl_label = "Calibrate"
@@ -88,7 +95,11 @@ class AI4A_OT_calibrate(bpy.types.Operator):
                 errors.append("%s: %s" % (source, error))
                 continue
             context.scene.ai4a.armature = arm
-            self.report({"INFO"}, "Calibrated from %s pose (max mismatch %.3f mm)" % (source, 1000 * calibration.max_residual))
+            character = selected_character(context.scene.ai4a)
+            self.report(
+                {"INFO"}, "Paired with %s from the %s pose (max mismatch %.3f mm)"
+                % (character.label, source, 1000 * calibration.max_residual)
+            )
             return {"FINISHED"}
         self.report({"ERROR"}, " | ".join(errors))
         return {"CANCELLED"}
@@ -106,7 +117,10 @@ class AI4A_OT_refresh_profile(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        self.report({"INFO"}, "Model environment OK: %d bones, %d styles" % (profile.bone_count, len(profile.guidance_names)))
+        self.report(
+            {"INFO"}, "Model environment OK: %s, %d bones, %d guidances"
+            % (profile.name, profile.bone_count, len(profile.guidance_names))
+        )
         return {"FINISHED"}
 
 
@@ -119,13 +133,16 @@ class AI4A_OT_capture_style(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.ai4a
+        if is_quadruped(settings):
+            self.report({"ERROR"}, "Custom styles need the biped model (the quadruped uses the demo's actions).")
+            return {"CANCELLED"}
         try:
             arm, calibration = pipeline.require_calibration(settings)
         except pipeline.PipelineError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         profile = get_profile(context.scene)
-        pose = calibration.to_ai4a(bio.snapshot_armature(arm, context.scene))
+        pose = pipeline.armature_pose(arm, context.scene, calibration, profile)
         positions = features.guidance_from_pose(pose, profile)
         name = settings.custom_style_name.strip() or "Custom"
         existing = {c.name: c for c in settings.custom_styles}
@@ -263,9 +280,10 @@ class AI4A_OT_setup_helpers(bpy.types.Operator):
         elif s.path_mode == "STICK" and s.left_stick is None:
             s.left_stick = create_stick(coll, "AI4A_LeftStick", (-1.5, -3.0, 0.0))
 
-        if s.facing_mode == "STICK" and s.right_stick is None:
+        facing = pipeline.facing_mode(s)
+        if facing == "STICK" and s.right_stick is None:
             s.right_stick = create_stick(coll, "AI4A_RightStick", (1.5, -3.0, 0.0))
-        elif s.facing_mode in ("LOOK_AT", "OBJECT") and s.facing_object is None:
+        elif facing in ("LOOK_AT", "OBJECT") and s.facing_object is None:
             s.facing_object = empty("AI4A_Facing", (0.0, -4.0, 0.0), "ARROWS")
         return {"FINISHED"}
 

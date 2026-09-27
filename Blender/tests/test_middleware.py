@@ -6,7 +6,7 @@ import pytest
 from synthetic import SyntheticRig, random_model_poses, random_rotation, rotation_about, tr
 
 from ai4animation_blender.middleware import conventions as cv
-from ai4animation_blender.middleware import exchange, features, rig
+from ai4animation_blender.middleware import exchange, features, models, rig
 
 POS_TOL = 1e-8
 DEG_TOL = 1e-6
@@ -158,6 +158,71 @@ def test_calibration_json_roundtrip(profile):
     assert set(again.reference_basis) == set(cal.reference_basis)
 
 
+def _drop_bones(snapshot, names):
+    """The same armature without some bones (e.g. an end site the file lacks)."""
+    keep = [i for i, n in enumerate(snapshot.bone_names) if n not in names]
+    parents = []
+    for i in keep:
+        p = snapshot.parent_indices[i]
+        while p >= 0 and snapshot.bone_names[p] in names:
+            p = snapshot.parent_indices[p]
+        parents.append(keep.index(p) if p >= 0 else -1)
+    return rig.ArmatureSnapshot(
+        bone_names=[snapshot.bone_names[i] for i in keep],
+        parent_indices=parents,
+        rest_matrices=snapshot.rest_matrices[keep],
+        armature_world=snapshot.armature_world,
+        meters_per_unit=snapshot.meters_per_unit,
+        pose_matrices=snapshot.pose_matrices[keep],
+        basis_matrices=snapshot.basis_matrices[keep],
+    )
+
+
+def test_calibration_allows_missing_end_sites(dog_profile):
+    # Dog.glb has no HeadSite; the quadruped demo creates it itself.
+    s = SyntheticRig(dog_profile, seed=17)
+    snap = _drop_bones(s.snapshot(), {"HeadSite"})
+    cal = rig.calibrate(snap, dog_profile)
+    assert cal.character == "dog"
+    assert cal.missing_bones == ["HeadSite"]
+    assert "HeadSite" not in cal.mapped_blender_bones
+    assert cal.max_residual < POS_TOL
+    a = cal.to_ai4a(snap)
+    k = dog_profile.bone_names.index("HeadSite")
+    assert np.all(np.isnan(a[k]))
+    present = cal.present
+    ref = cv.orthonormalize_transforms(dog_profile.reference_transforms)
+    assert np.abs(a[present, :3, 3] - ref[present, :3, 3]).max() < POS_TOL
+    again = rig.Calibration.from_json(cal.to_json())
+    assert again.blender_bone_names == cal.blender_bone_names
+    assert again.character == "dog"
+
+
+def test_calibration_requires_bones_that_are_not_end_sites(profile, dog_profile):
+    assert profile.end_sites() == []  # Geno: every model bone is required
+    s = SyntheticRig(profile, seed=18)
+    with pytest.raises(ValueError, match="Missing: \\['LeftHand'\\]"):
+        rig.calibrate(_drop_bones(s.snapshot(), {"LeftHand"}), profile)
+    assert set(dog_profile.end_sites()) == {
+        "HeadSite", "LeftHandSite", "RightHandSite", "LeftFootSite", "RightFootSite", "Tail1Site"
+    }
+
+
+def test_roundtrip_with_missing_end_site(dog_profile):
+    s = SyntheticRig(dog_profile, seed=19)
+    snap = _drop_bones(s.snapshot(), {"HeadSite"})
+    cal = rig.calibrate(snap, dog_profile)
+    poses = random_model_poses(dog_profile, 4, seed=20)
+    basis, pose = cal.to_blender_basis(snap, poses, rig.LOCATION_ALL)
+    assert basis.shape == (4, len(snap.bone_names), 4, 4)
+    present = cal.present
+    for f in range(poses.shape[0]):
+        back = cal.to_ai4a(snap, pose[f])
+        expected = cv.orthonormalize_transforms(poses[f])
+        assert np.abs(back[present, :3, 3] - expected[present, :3, 3]).max() < 1e-8
+        assert cv.rotation_angle_deg(back[present, :3, :3], expected[present, :3, :3]).max() < 1e-5
+
+
 @pytest.mark.parametrize("orthonormal", [True, False])
 def test_model_to_blender_to_model_roundtrip(profile, orthonormal):
     s = SyntheticRig(profile, seed=8)
@@ -255,6 +320,39 @@ def test_guidance_is_root_relative(profile):
     assert g0.shape == (profile.bone_count, 3)
     assert np.allclose(g0, g1, atol=1e-9)
     assert np.isclose(g0[profile.bone_names.index("Hips"), 0], 0.0, atol=1e-9)
+
+
+def test_quadruped_root_faces_from_hips_to_neck(dog_profile):
+    ref = dog_profile.reference_transforms
+    root = features.compute_root(ref, dog_profile)
+    p = cv.as_matrix(ref)[:, :3, 3]
+    hips, neck = (p[dog_profile.bone_names.index(n)] for n in ("Hips", "Neck"))
+    forward = (neck - hips) * [1, 0, 1]
+    assert np.allclose(root[:3, 2], forward / np.linalg.norm(forward))
+    assert np.allclose(root[:3, 3], [hips[0], 0.0, hips[2]])
+    move = tr(rotation_about([0, 1, 0], -70.0), [1.0, 0.0, 3.0])
+    moved = np.einsum("ij,bjk->bik", move, ref)
+    assert np.allclose(features.compute_root(moved, dog_profile), move @ root, atol=1e-9)
+
+
+def test_complete_pose_fills_missing_bones_from_the_reference(dog_profile):
+    ref = cv.orthonormalize_transforms(dog_profile.reference_transforms)
+    move = tr(rotation_about([0, 1, 0], 50.0), [2.0, 0.0, -1.0])
+    pose = np.einsum("ij,bjk->bik", move, ref)
+    names = dog_profile.bone_names
+    tail_site, head_site = names.index("Tail1Site"), names.index("HeadSite")
+    tail = names.index("Tail1")
+    pose[tail] = pose[tail] @ tr(rotation_about([1, 0, 0], 30.0), np.zeros(3))  # bend the tail
+    holes = pose.copy()
+    holes[[tail_site, head_site]] = np.nan
+    done = features.complete_pose(holes, dog_profile)
+    assert np.all(np.isfinite(done))
+    # with a parent: keeps the reference offset to it (follows the bent tail)
+    expected = pose[tail] @ np.linalg.inv(ref[tail]) @ ref[tail_site]
+    assert np.allclose(done[tail_site], expected, atol=1e-9)
+    # without a parent (Dog's loose HeadSite): moves rigidly with the body
+    assert np.allclose(done[head_site], move @ ref[head_site], atol=1e-6)
+    assert np.array_equal(features.complete_pose(pose, dog_profile), pose)
 
 
 def test_look_planar_handles_vertical_direction():
@@ -399,3 +497,58 @@ def test_exchange_stick_requests(tmp_path, profile):
             tmp_path / "c.npz", dict(base, facing_mode=exchange.FACING_LOOK_AT),
             path_points=np.zeros((3, 3)), **common,
         )
+
+
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model", sorted(models.MODELS))
+def test_shipped_profiles_match_the_model_registry(model):
+    from conftest import PROFILES_DIR
+
+    spec = models.get(model)
+    for character in spec.characters:
+        prof = rig.RigProfile.from_json((PROFILES_DIR / character.profile_file).read_text())
+        assert (prof.model, prof.character, prof.root_topology) == (spec.key, character.key, spec.root_topology)
+        assert prof.model_file == character.model_file
+        assert prof.sequence["network_input_dim"] == spec.network_input_dim(prof.bone_count)
+        assert prof.sequence["postprocessor_input_dim"] == spec.postprocessor_input_dim(
+            prof.bone_count, len(prof.contact_bones), prof.sequence["length"]
+        )
+        assert models.character_model(character.key) is spec
+        assert models.character_label(character.key) == character.label
+
+
+def test_requests_default_to_the_biped(tmp_path, profile):
+    assert exchange.model_meta({}) == {"type": "BIPED", "character": "geno", "network": "", "postprocessor": ""}
+    exchange.save_request(
+        tmp_path / "old.npz", _meta(profile), speeds=np.ones(5), style_indices=np.zeros(5, int),
+        path_points=np.zeros((3, 3)), custom_guidances=np.zeros((1, profile.bone_count, 3)),
+    )
+
+
+def test_exchange_quadruped_requests(tmp_path, dog_profile):
+    base = dict(
+        _meta(dog_profile),
+        model={"type": "QUADRUPED", "character": "dog"},
+        controller=exchange.CONTROLLER_STICK,
+        path_mode=exchange.PATH_STICK,
+        style_names=["Auto", "Sit"],
+    )
+    common = dict(speeds=np.ones(5), style_indices=np.zeros(5, int), move_sticks=np.zeros((5, 3)))
+    exchange.save_request(tmp_path / "ok.npz", base, start_transform=np.eye(4), **common)
+    meta, _ = exchange.load_request(tmp_path / "ok.npz")
+    assert exchange.model_meta(meta)["character"] == "dog"
+    bad = [
+        (dict(base, model={"type": "QUADRUPED", "character": "geno"}), "model.character"),
+        (dict(base, model={"type": "HEXAPOD"}), "model.type"),
+        (dict(base, controller=exchange.CONTROLLER_GOAL), "needs controller STICK"),
+        (dict(base, facing_mode=exchange.FACING_DIRECTION), "facing_mode MOVE"),
+        (dict(base, style_names=["Auto", "Zombie"]), "QUADRUPED styles"),
+    ]
+    for k, (meta, message) in enumerate(bad):
+        extra = {"facing_directions": np.zeros((5, 3))} if "facing_mode" in meta else {}
+        with pytest.raises(ValueError, match=message):
+            exchange.save_request(tmp_path / ("bad%d.npz" % k), meta, **common, **extra)

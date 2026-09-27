@@ -502,5 +502,8 @@
   "fps": 30,
   "network_input_dim": 441,
   "postprocessor_input_dim": 456
- }
+ },
+ "model": "BIPED",
+ "character": "geno",
+ "root_topology": "BIPED"
 }

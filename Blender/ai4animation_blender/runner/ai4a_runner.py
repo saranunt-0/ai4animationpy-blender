@@ -8,14 +8,21 @@ ai4animation_blender.middleware.exchange, all in AI4Animation world space.
     python ai4a_runner.py profile --repo <ai4animationpy> --out profile.json
     python ai4a_runner.py run     --repo <ai4animationpy> --request req.npz --result res.npz
 
-The simulation reuses Demos/Authoring (MotionController, PathPlanner3D) as-is,
-driven in AI4Animation MANUAL mode with a fixed time step, so Blender gets the
-same controller behavior as the standalone demo.
+The simulation reuses the demos' controller code as-is, driven in
+AI4Animation MANUAL mode with a fixed time step, so Blender gets the same
+behavior as the standalone demos:
+
+    BIPED      Demos/Authoring MotionController (Geno)
+    QUADRUPED  Demos/Locomotion/Quadruped Program (Dog / Wolf): Predict and
+               Animate unchanged, Control fed by the virtual player
+
+    python ai4a_runner.py profile --repo <repo> --model QUADRUPED --character dog --out dog.json
 """
 
 import argparse
 import contextlib
 import functools
+import importlib.util
 import math
 import os
 import sys
@@ -30,11 +37,11 @@ ADDONS_DIR = Path(__file__).resolve().parents[2]
 if str(ADDONS_DIR) not in sys.path:
     sys.path.insert(0, str(ADDONS_DIR))
 
-from ai4animation_blender.middleware import exchange, features  # noqa: E402
+from ai4animation_blender.middleware import exchange, features, models  # noqa: E402
 from ai4animation_blender.middleware.rig import RigProfile  # noqa: E402
 
-AUTHORING_DIR = Path("Demos") / "Authoring"
-ASSETS_DIR = Path("Demos") / "_ASSETS_" / "Geno"
+AUTHORING_DIR = Path(models.MODELS[models.BIPED].demo_dir)
+PATH_PLANNER = AUTHORING_DIR / "PathPlanner3D.py"  # spline + planner, used by every model
 
 # Must match Demos/Authoring/Program.py
 SPLINE_RESOLUTION = 80
@@ -89,9 +96,15 @@ def device_safe_torch_load():
         torch.load = original
 
 
-def setup_paths(repo):
+def setup_paths(repo, spec=None):
+    """Put the model's assets (Definitions.py) and demo folder on sys.path.
+
+    Only one model per process: both demos ship LegIK.py, Sequence.py and
+    Program.py under the same names.
+    """
+    spec = spec or models.MODELS[models.BIPED]
     repo = Path(repo).resolve()
-    for sub in (repo / ASSETS_DIR, repo / AUTHORING_DIR, repo):
+    for sub in (repo / spec.assets_dir, repo / spec.demo_dir, repo):
         if not sub.is_dir():
             raise FileNotFoundError("Expected directory not found: %s" % sub)
         if str(sub) not in sys.path:
@@ -99,8 +112,89 @@ def setup_paths(repo):
     return repo
 
 
-def create_controller(repo):
-    """Boot AI4Animation in MANUAL mode and build the Authoring MotionController."""
+def load_module(path, name):
+    """Import a demo file under a unique module name (no clash with other demos)."""
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def path_planner(repo):
+    return load_module(Path(repo) / PATH_PLANNER, "ai4a_path_planner3d")
+
+
+def resolve_file(path):
+    """`path`, or a file in the same folder whose name differs only in case.
+
+    The quadruped demo loads "PostProcessor.pt" but ships "Postprocessor.pt",
+    which only works on case-insensitive file systems.
+    """
+    path = Path(path)
+    if path.is_file():
+        return path
+    if path.parent.is_dir():
+        for candidate in path.parent.iterdir():
+            if candidate.name.lower() == path.name.lower() and candidate.is_file():
+                return candidate
+    raise FileNotFoundError("Network file not found: %s" % path)
+
+
+def network_files(repo, spec, info):
+    """(network, postprocessor): the user's overrides or the demo's files."""
+    demo = Path(repo) / spec.demo_dir
+    network = resolve_file(info.get("network") or demo / spec.network)
+    postprocessor = resolve_file(info.get("postprocessor") or demo / spec.postprocessor)
+    return network, postprocessor
+
+
+def load_network(path):
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = torch.load(str(path), weights_only=False, map_location=device)
+    model.eval()
+    return model
+
+
+def check_networks(controller, spec, network, postprocessor):
+    """The networks must read exactly what this model's controller feeds them."""
+    bones = controller.Actor.GetBoneCount()
+    contacts = len(controller.ContactBones)
+    expected = spec.network_input_dim(bones)
+    got = int(controller.Model.input_dim())
+    if got != expected:
+        raise ValueError(
+            "Network %s expects %d inputs, but the %s controller feeds %d (%d bones). "
+            "Pick a network trained for this model." % (network, got, spec.label, expected, bones)
+        )
+    expected = spec.postprocessor_input_dim(bones, contacts)
+    got = int(controller.PostProcessor.input_dim())
+    if got != expected:
+        raise ValueError(
+            "PostProcessor %s expects %d inputs, but the %s controller feeds %d. "
+            "Pick the contact network trained with this model." % (postprocessor, got, spec.label, expected)
+        )
+
+
+def create_controller(repo, spec=None, info=None):
+    """Boot AI4Animation in MANUAL mode and build the model's controller."""
+    spec = spec or models.MODELS[models.BIPED]
+    info = exchange.model_meta({"model": dict(info or {}, type=spec.key)})
+    network, postprocessor = network_files(repo, spec, info)
+    if spec.key == models.QUADRUPED:
+        controller = create_quadruped(repo, spec, info["character"], network, postprocessor)
+    else:
+        controller = create_biped(repo, network, postprocessor)
+    check_networks(controller, spec, network, postprocessor)
+    return controller
+
+
+def create_biped(repo, network, postprocessor):
+    """The Authoring MotionController; custom networks replace the demo's after loading."""
     from ai4animation import AI4Animation
 
     holder = {}
@@ -113,16 +207,101 @@ def create_controller(repo):
                 holder["controller"] = MotionController()
 
     AI4Animation(_Boot(), mode=AI4Animation.Mode.MANUAL)
-    return holder["controller"]
+    controller = holder["controller"]
+    demo = repo / AUTHORING_DIR / "Models"
+    if network.resolve() != resolve_file(demo / "Network.pt").resolve():
+        controller.Model = load_network(network)
+    if postprocessor.resolve() != resolve_file(demo / "PostProcessor.pt").resolve():
+        controller.PostProcessor = load_network(postprocessor)
+    return controller
 
 
-def build_profile(controller, repo):
+class _Headless:
+    """Stands in for AI4Animation.Standalone inside the quadruped Program only:
+    its Start() sets a camera target and checks the gamepad."""
+
+    class _NoOp:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    Camera = _NoOp()
+    IO = _NoOp()
+
+
+def create_quadruped(repo, spec, character, network, postprocessor):
+    """Demos/Locomotion/Quadruped Program, started headless.
+
+    The demo's own Start() runs with three shims: one character only (the
+    demo creates hidden copies that need a renderer), a module-local
+    AI4Animation whose Standalone is a no-op camera/gamepad, and torch.load
+    redirected to the chosen network files (on CPU if needed). Predict and
+    Animate are the demo's; Control is replaced by quadruped_control.
+    """
+    import torch
+    from ai4animation import AI4Animation
+
+    program = load_module(repo / spec.demo_dir / "Program.py", "ai4a_quadruped_program")
+    if character not in program.CHARACTER_MODELS:
+        raise ValueError("Unknown quadruped character %r (%s)" % (character, sorted(program.CHARACTER_MODELS)))
+
+    class _Boot:
+        def Start(self):
+            pass
+
+    AI4Animation(_Boot(), mode=AI4Animation.Mode.MANUAL)
+
+    class _ModuleAI4Animation:
+        Standalone = _Headless()
+
+        def __getattr__(self, name):
+            return getattr(AI4Animation, name)
+
+    program.AI4Animation = _ModuleAI4Animation()
+    program.CHARACTER_MODELS = {character: program.CHARACTER_MODELS[character]}
+
+    files = {"network.pt": network, "postprocessor.pt": postprocessor}
+    original = torch.load
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    @functools.wraps(original)
+    def load(path, *args, **kwargs):
+        kwargs.setdefault("map_location", device)
+        return original(str(files.get(Path(path).name.lower(), path)), *args, **kwargs)
+
+    controller = program.Program()
+    controller.Character = character
+    torch.load = load
+    try:
+        with working_directory(repo / spec.demo_dir):
+            controller.Start()
+    finally:
+        torch.load = original
+    controller.Module = program
+    controller.Command = np.zeros(3)
+    controller.Action = None
+    controller.Control = types.MethodType(quadruped_control, controller)
+    return controller
+
+
+def build_profile(controller, repo, spec=None, character=None):
     import Definitions
 
+    spec = spec or models.MODELS[models.BIPED]
+    character = spec.character(character or spec.characters[0].key)
     actor = controller.Actor
+    if spec.key == models.QUADRUPED:
+        module = controller.Module
+        guidance_names = sorted(controller.GuidanceTemplates)
+        window, length, fps = module.SEQUENCE_WINDOW, module.SEQUENCE_LENGTH, module.SEQUENCE_FPS
+    else:
+        guidance_names = list(controller.GuidanceNames)
+        window, length, fps = controller.SequenceWindow, controller.SequenceLength, controller.SequenceFPS
     return RigProfile(
-        name="Geno",
-        model_file=str(ASSETS_DIR / "Model.glb"),
+        name=character.label,
+        model_file=character.model_file,
+        model=spec.key,
+        character=character.key,
+        root_topology=spec.root_topology,
         bone_names=list(actor.GetBoneNames()),
         parent_names=list(actor.GetParentNames()),
         reference_transforms=np.array(actor.Transforms, dtype=float),
@@ -135,11 +314,11 @@ def build_profile(controller, repo):
             "neck": Definitions.NeckName,
         },
         contact_bones=list(controller.ContactBones),
-        guidance_names=list(controller.GuidanceNames),
+        guidance_names=guidance_names,
         sequence={
-            "window": float(controller.SequenceWindow),
-            "length": int(controller.SequenceLength),
-            "fps": int(controller.SequenceFPS),
+            "window": float(window),
+            "length": int(length),
+            "fps": int(fps),
             "network_input_dim": int(controller.Model.input_dim()),
             "postprocessor_input_dim": int(controller.PostProcessor.input_dim()),
         },
@@ -200,7 +379,7 @@ class PathReference:
     path, so a lagging character is pulled along instead of cutting corners.
     """
 
-    def __init__(self, path, end_behavior, leash, gain, spacing=0.05):
+    def __init__(self, path, end_behavior, leash, gain, spacing=0.05, max_command=None):
         from ai4animation import Spline
 
         length = max(float(path.GetPathLength()), 1e-5)
@@ -213,7 +392,7 @@ class PathReference:
         self.Length = float(self.Arc[-1])
         self.EndBehavior = end_behavior
         self.Leash = float(leash)
-        self.Tracker = ReferenceTracker(gain)
+        self.Tracker = ReferenceTracker(gain, max_command)
         self.S = 0.0
         self.Projected = 0.0
         self.Sign = 1.0
@@ -280,8 +459,9 @@ class ReferenceTracker:
     released within STOP_RADIUS and re-engaged beyond RESUME_RADIUS.
     """
 
-    def __init__(self, gain):
+    def __init__(self, gain, max_command=None):
         self.Gain = float(gain)
+        self.MaxCommand = MAX_COMMAND if max_command is None else float(max_command)
         self.Engaged = True
 
     def command(self, reference, reference_velocity, position):
@@ -300,8 +480,8 @@ class ReferenceTracker:
             return np.zeros(3)
         velocity = feedforward + self.Gain * error
         speed = float(np.linalg.norm(velocity))
-        if speed > MAX_COMMAND:
-            velocity *= MAX_COMMAND / speed
+        if speed > self.MaxCommand:
+            velocity *= self.MaxCommand / speed
         return velocity
 
 
@@ -346,10 +526,108 @@ def stick_control(self, command, control_strength, guidance_pose):
         )
 
 
-def build_path(meta, arrays, warnings):
+def quadruped_control(self):
+    """Control() of Demos/Locomotion/Quadruped/Program.py without the gamepad.
+
+    self.Command is the virtual left stick as a world velocity (m/s) and
+    self.Action one of Sit / Stand / Lie or None. Everything after reading the
+    input is the demo's: PID speed smoothing, facing = movement, gait guidance
+    by speed, action poses only below ACTION_TRIGGER_SPEED_MAX, trajectory
+    correction. One difference: an action also releases the stick (the demo
+    needs the player to stop first), so a keyed "Sit" slows down, then sits.
+    """
+    from ai4animation import Tensor, Time, Transform, Vector3
+
+    demo = self.Module
+    command = np.array(self.Command, dtype=float).reshape(3)
+    command[1] = 0.0
+    action = self.Action
+    current_speed = self.GetCurrentSpeed()
+
+    desired_speed = float(np.linalg.norm(command))
+    move_direction = command / desired_speed if desired_speed > 1e-6 else Vector3.Zero()
+    if action is not None:
+        desired_speed = 0.0
+
+    can_trigger_action_pose = current_speed < demo.ACTION_TRIGGER_SPEED_MAX
+    sit_active = can_trigger_action_pose and action == "Sit"
+    stand_active = can_trigger_action_pose and action == "Stand"
+    lie_active = can_trigger_action_pose and action == "Lie"
+
+    action_pose_active = sit_active or lie_active or stand_active
+    target_speed = 0.0 if action_pose_active else desired_speed
+
+    speed = current_speed + self.PID(current_speed, Time.DeltaTime, setpoint=target_speed)
+    speed = max(speed, 0.0)
+
+    if action_pose_active:
+        speed = 0.0
+        velocity = Vector3.Zero()
+        direction = self.Actor.GetRootDirection()
+    else:
+        velocity = speed * move_direction
+        direction = velocity
+
+    self._UpdatePIDSpeedHistory(current_speed, target_speed, speed)
+
+    position = Vector3.Lerp(
+        self.SimulationObject.GetPosition(0),
+        self.Actor.GetRootPosition(),
+        self.Synchronization,
+    )
+    self.SimulationObject.Control(position, direction, velocity, Time.DeltaTime)
+
+    speed = Vector3.Length(velocity)
+    modes = demo.LOCOMOTION_MODES
+    if sit_active:
+        guidance_state = "Sit"
+    elif lie_active:
+        guidance_state = "Lie"
+    elif stand_active:
+        guidance_state = "Stand"
+    elif speed < 0.1:
+        guidance_state = "Sit" if self.Sequence is None else "Idle"
+    elif speed < modes["pace"]:
+        guidance_state = "Walk"
+    elif speed < modes["trot"]:
+        guidance_state = "Pace"
+    elif speed < modes["canter"]:
+        guidance_state = "Trot"
+    else:
+        guidance_state = "Canter"
+
+    self.CurrentGuidanceState = guidance_state
+    self.GuidanceControl.Positions = self.GuidanceTemplates[guidance_state].Positions.copy()
+
+    self.RootControl.Transforms = self.SimulationObject.Transforms.copy()
+    self.RootControl.Velocities = self.SimulationObject.Velocities.copy()
+
+    # Correction (as in the demo)
+    if self.Sequence is not None:
+        self.RootControl.Transforms = Transform.Interpolate(
+            self.SimulationObject.Transforms,
+            self.Sequence.Trajectory.Transforms,
+            self.TrajectoryCorrection,
+        )
+        for i in range(self.RootControl.SampleCount):
+            target = Transform.GetPosition(self.RootControl.Transforms)[i:]
+            current = self.Actor.GetRootPosition().reshape(-1, 3)
+            time = self.RootControl.Timestamps[i:].reshape(-1, 1)
+            self.RootControl.Velocities[i] = Tensor.Sum(
+                target - current, axis=0, keepDim=False
+            ) / Tensor.Sum(time, axis=0, keepDim=False)
+        self.RootControl.Velocities = Vector3.Lerp(
+            self.RootControl.Velocities,
+            self.Sequence.Trajectory.Velocities,
+            self.TrajectoryCorrection,
+        )
+
+
+def build_path(repo, meta, arrays, warnings):
     """The demo Path object for CURVE / PLANNER modes (None otherwise)."""
-    from PathPlanner3D import Path as SplinePath
-    from PathPlanner3D import PathPlanner3D
+    planner_module = path_planner(repo)
+    SplinePath = planner_module.Path
+    PathPlanner3D = planner_module.PathPlanner3D
 
     mode = meta["path_mode"]
     if mode == exchange.PATH_CURVE:
@@ -437,11 +715,7 @@ def initialize_state(controller, profile, meta, arrays, first_goal):
     actor.Transforms[...] = pose
     actor.Velocities[...] = velocities
     actor.SetRoot(np.array(root, dtype=np.float32))
-    for leg in (controller.LeftLegIK, controller.RightLegIK):
-        leg.AnkleTargetPosition = leg.AnkleIK.LastBone().GetPosition().copy()
-        leg.AnkleTargetRotation = leg.AnkleIK.LastBone().GetRotation().copy()
-        leg.BallTargetPosition = leg.BallIK.LastBone().GetPosition().copy()
-        leg.BallTargetRotation = leg.BallIK.LastBone().GetRotation().copy()
+    reset_leg_ik(controller)
 
     position = Transform.GetPosition(actor.Root).copy()
     position[1] = 0.0
@@ -452,6 +726,22 @@ def initialize_state(controller, profile, meta, arrays, first_goal):
             series.SetDirection(direction, i)
             series.SetVelocity(Vector3.Zero(), i)
     actor.SyncToScene()
+
+
+def reset_leg_ik(controller):
+    """Point the leg IK targets at the new pose (they remember the last contact)."""
+    for name in ("LeftLegIK", "RightLegIK"):  # biped: ankle + ball chains
+        leg = getattr(controller, name, None)
+        if leg is not None:
+            leg.AnkleTargetPosition = leg.AnkleIK.LastBone().GetPosition().copy()
+            leg.AnkleTargetRotation = leg.AnkleIK.LastBone().GetRotation().copy()
+            leg.BallTargetPosition = leg.BallIK.LastBone().GetPosition().copy()
+            leg.BallTargetRotation = leg.BallIK.LastBone().GetRotation().copy()
+    for name in ("LeftHandIK", "RightHandIK", "LeftFootIK", "RightFootIK"):  # quadruped: one chain per leg
+        leg = getattr(controller, name, None)
+        if leg is not None:
+            leg.TargetPosition = leg.IK.LastBone().GetPosition().copy()
+            leg.TargetRotation = leg.IK.LastBone().GetRotation().copy()
 
 
 def current_contacts(controller, prediction_fps):
@@ -471,15 +761,18 @@ def current_contacts(controller, prediction_fps):
 def run(repo, request_path, result_path):
     started = time.time()
     meta, arrays = exchange.load_request(request_path)
-    repo = setup_paths(repo)
-    controller = create_controller(repo)
-    profile = build_profile(controller, repo)
+    info = exchange.model_meta(meta)
+    spec = models.get(info["type"])
+    quadruped = spec.key == models.QUADRUPED
+    repo = setup_paths(repo, spec)
+    controller = create_controller(repo, spec, info)
+    profile = build_profile(controller, repo, spec, info["character"])
 
     if list(meta["bone_names"]) != profile.bone_names:
         raise ValueError(
             "Request bone order %s does not match the model %s" % (meta["bone_names"], profile.bone_names)
         )
-    controller.NetworkIterations = int(meta.get("network_iterations", controller.NetworkIterations))
+    controller.NetworkIterations = int(meta.get("network_iterations", spec.network_iterations))
 
     from ai4animation import AI4Animation, Time
 
@@ -492,7 +785,12 @@ def run(repo, request_path, result_path):
     strength = float(meta.get("control_strength", 2.0))
     speeds = np.asarray(arrays["speeds"], dtype=float)
     style_indices = np.asarray(arrays["style_indices"], dtype=int)
-    styles = resolve_guidances(controller, meta, arrays)
+    if quadruped:
+        # the demo reads its prediction rate from a module constant
+        controller.Module.PREDICTION_FPS = prediction_fps
+        styles = [None if name == models.QUADRUPED_AUTO else name for name in meta["style_names"]]
+    else:
+        styles = resolve_guidances(controller, meta, arrays)
 
     def goal_at(frame, walked_distance):
         if follower is None:
@@ -502,7 +800,7 @@ def run(repo, request_path, result_path):
     mode = meta["path_mode"]
     control = meta.get("controller", exchange.CONTROLLER_GOAL)
     end_behavior = meta.get("end_behavior", exchange.END_STOP)
-    path = build_path(meta, arrays, warnings)
+    path = build_path(repo, meta, arrays, warnings)
     follower = PathFollower(path, end_behavior) if path is not None else None
     if mode == exchange.PATH_STICK:
         first_goal = np.asarray(arrays.get("start_transform", np.eye(4)), dtype=np.float32)
@@ -515,13 +813,15 @@ def run(repo, request_path, result_path):
     reference = None
     tracker = None
     if control == exchange.CONTROLLER_STICK:
-        controller.Control = types.MethodType(stick_control, controller)
+        if not quadruped:  # the quadruped controller already has its stick Control
+            controller.Control = types.MethodType(stick_control, controller)
         cfg = dict(exchange.DEFAULT_TRACKING, **meta.get("tracking", {}))
         assist = bool(cfg["assist"])
-        tracker = ReferenceTracker(cfg["gain"])
+        max_command = max(MAX_COMMAND, spec.max_speed + 1.0)
+        tracker = ReferenceTracker(cfg["gain"], max_command)
         leash = float(cfg["leash"])
         if path is not None:
-            reference = PathReference(path, end_behavior, leash, cfg["gain"])
+            reference = PathReference(path, end_behavior, leash, cfg["gain"], max_command=max_command)
         # Start the stick's ghost where the actor really starts (initial pose may differ).
         ghost = np.array(controller.Actor.GetRootPosition(), dtype=float).reshape(3)
     facing_mode = meta.get("facing_mode", exchange.FACING_MOVE)
@@ -589,7 +889,12 @@ def run(repo, request_path, result_path):
         guidance = None
 
         def Update(self):
-            controller.Update(self.command, strength, self.guidance, Time.DeltaTime, prediction_fps)
+            if quadruped:
+                controller.Command = self.command[0]
+                controller.Action = self.guidance
+                controller.Update()
+            else:
+                controller.Update(self.command, strength, self.guidance, Time.DeltaTime, prediction_fps)
 
     stepper = _Stepper()
     AI4Animation.Program = stepper
@@ -629,6 +934,7 @@ def run(repo, request_path, result_path):
             "frame_count": frames,
             "substeps": substeps,
             "controller": control,
+            "model": info,
             "bone_names": profile.bone_names,
             "contact_bones": profile.contact_bones,
             "warnings": warnings,
@@ -648,10 +954,12 @@ def run(repo, request_path, result_path):
         log("WARNING:", w)
 
 
-def profile_command(repo, out_path):
-    repo = setup_paths(repo)
-    controller = create_controller(repo)
-    profile = build_profile(controller, repo)
+def profile_command(repo, out_path, model=models.BIPED, character=None, network="", postprocessor=""):
+    spec = models.get(model)
+    info = {"character": character or spec.characters[0].key, "network": network, "postprocessor": postprocessor}
+    repo = setup_paths(repo, spec)
+    controller = create_controller(repo, spec, info)
+    profile = build_profile(controller, repo, spec, info["character"])
     Path(out_path).write_text(profile.to_json())
     log("profile written to", out_path)
 
@@ -662,6 +970,10 @@ def main(argv=None):
     p = sub.add_parser("profile", help="Write the rig profile (bones, reference pose, styles).")
     p.add_argument("--repo", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--model", default=models.BIPED, choices=sorted(models.MODELS))
+    p.add_argument("--character", default=None)
+    p.add_argument("--network", default="", help="Network .pt to use instead of the demo's")
+    p.add_argument("--postprocessor", default="", help="Contact network .pt to use instead of the demo's")
     r = sub.add_parser("run", help="Simulate a request and write the result.")
     r.add_argument("--repo", required=True)
     r.add_argument("--request", required=True)
@@ -669,7 +981,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "profile":
-            profile_command(args.repo, args.out)
+            profile_command(args.repo, args.out, args.model, args.character, args.network, args.postprocessor)
         else:
             run(args.repo, args.request, args.result)
     except Exception as error:  # report cleanly to Blender, which shows stderr

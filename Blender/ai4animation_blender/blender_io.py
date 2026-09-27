@@ -63,7 +63,7 @@ def store_calibration(obj, calibration):
 def check_bone_setup(obj, calibration):
     """Settings under which the middleware's FK rule no longer matches Blender."""
     warnings = []
-    names = set(calibration.blender_bone_names)
+    names = set(calibration.mapped_blender_bones)
     for pb in obj.pose.bones:
         chain_relevant = pb.name in names or any(c.name in names for c in pb.children_recursive)
         if not chain_relevant:
@@ -81,7 +81,7 @@ def check_bone_setup(obj, calibration):
 
 
 def connected_bones(obj, calibration):
-    return [n for n in calibration.blender_bone_names if obj.data.bones[n].use_connect]
+    return [n for n in calibration.mapped_blender_bones if obj.data.bones[n].use_connect]
 
 
 # ----------------------------------------------------------------------------
@@ -250,8 +250,10 @@ def bake_basis(obj, basis, frame_numbers, bone_names, action_name, constant_bone
 def verify_bake(scene, obj, calibration, expected_ai4a, frame_numbers, samples=3):
     """Re-evaluate Blender at a few frames and compare against the model data.
 
-    Returns (max position error in meters, max rotation error in degrees).
+    Returns (max position error in meters, max rotation error in degrees)
+    over the model bones the armature has.
     """
+    present = calibration.present
     count = len(frame_numbers)
     picks = sorted({0, count // 2, count - 1})[:samples]
     current = scene.frame_current
@@ -260,8 +262,8 @@ def verify_bake(scene, obj, calibration, expected_ai4a, frame_numbers, samples=3
         for k in picks:
             scene.frame_set(int(frame_numbers[k]))
             snap = snapshot_armature(obj, scene)
-            got = calibration.to_ai4a(snap)
-            want = cv.orthonormalize_transforms(expected_ai4a[k])
+            got = calibration.to_ai4a(snap)[present]
+            want = cv.orthonormalize_transforms(expected_ai4a[k][present])
             pos_err = max(pos_err, float(np.abs(got[:, :3, 3] - want[:, :3, 3]).max()))
             rot_err = max(rot_err, float(cv.rotation_angle_deg(got[:, :3, :3], want[:, :3, :3]).max()))
     finally:

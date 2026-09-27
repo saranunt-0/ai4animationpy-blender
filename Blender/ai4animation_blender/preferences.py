@@ -28,7 +28,8 @@ class AI4A_Preferences(bpy.types.AddonPreferences):
         name="Model Python",
         description=(
             "Python executable of the environment where ai4animation and torch are installed "
-            "(NOT Blender's Python), e.g. ~/miniconda3/envs/ai4animation/bin/python"
+            "(NOT Blender's Python). Windows: <venv>\\Scripts\\python.exe, "
+            "Linux/macOS: <venv>/bin/python"
         ),
         subtype="FILE_PATH",
         default=os.environ.get("AI4A_PYTHON", ""),
